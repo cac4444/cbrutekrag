@@ -17,7 +17,7 @@ typedef struct {
 /* list of proxies: count and pointer to array of btkg_proxy_t */
 typedef struct {
     size_t count;        /* number of proxies stored */
-    btkg_proxy_t *items; /* dynamically allocated array (length >= count) */
+    btkg_proxy_t *proxies; /* dynamically allocated array (length >= count) */
     size_t capacity;     /* internal capacity (not required but helpful) */
 } btkg_proxy_list_t;
 
