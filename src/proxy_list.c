@@ -16,16 +16,16 @@ void btkg_proxy_list_init(btkg_proxy_list_t *list) {
     if (!list) return;
     list->count = 0;
     list->capacity = BTKG_PROXY_LIST_INITIAL_CAP;
-    list->items = calloc(list->capacity, sizeof(btkg_proxy_t));
-    if (!list->items) {
+    list->proxies = calloc(list->capacity, sizeof(btkg_proxy_t));
+    if (!list->proxies) {
         list->capacity = 0;
     }
 }
 
 void btkg_proxy_list_free(btkg_proxy_list_t *list) {
     if (!list) return;
-    free(list->items);
-    list->items = NULL;
+    free(list->proxies);
+    list->proxies = NULL;
     list->count = 0;
     list->capacity = 0;
 }
@@ -83,22 +83,22 @@ int btkg_proxy_list_append(btkg_proxy_list_t *list, const char *ip_str, uint16_t
     if (inet_pton(AF_INET, ip_str, &tmp) != 1) return -1;
     if (port == 0) return -1;
 
-    if (!list->items) {
+    if (!list->proxies) {
         list->capacity = BTKG_PROXY_LIST_INITIAL_CAP;
-        list->items = calloc(list->capacity, sizeof(btkg_proxy_t));
-        if (!list->items) return -1;
+        list->proxies = calloc(list->capacity, sizeof(btkg_proxy_t));
+        if (!list->proxies) return -1;
     }
 
     if (list->count >= list->capacity) {
         size_t newcap = list->capacity ? list->capacity * 2 : BTKG_PROXY_LIST_INITIAL_CAP;
-        btkg_proxy_t *tmpitems = realloc(list->items, newcap * sizeof(btkg_proxy_t));
-        if (!tmpitems) return -1;
-        list->items = tmpitems;
+        btkg_proxy_t *tmpproxies = realloc(list->proxies, newcap * sizeof(btkg_proxy_t));
+        if (!tmpproxies) return -1;
+        list->proxies = tmpproxies;
         list->capacity = newcap;
     }
 
     /* append */
-    btkg_proxy_t *dst = &list->items[list->count++];
+    btkg_proxy_t *dst = &list->proxies[list->count++];
     strncpy(dst->ip, ip_str, sizeof(dst->ip));
     dst->ip[sizeof(dst->ip) - 1] = '\0';
     dst->port = port;
