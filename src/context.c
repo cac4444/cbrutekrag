@@ -23,6 +23,7 @@ SOFTWARE.
 
 #include "cbrutekrag.h"
 #include "target.h"
+#include "proxy_list.h"
 
 /**
  * @brief Initializes the options structure with default values.
@@ -38,9 +39,11 @@ void btkg_options_init(btkg_options_t *options)
 		return;
 
 	options->timeout = 3;
+	options->proxy_timeout = 5;
 	options->max_threads = 1;
 	options->progress_bar = 0;
 	options->verbose = 0;
+	options->proxy = 0;
 	options->dry_run = 0;
 	options->perform_scan = 0;
 	options->non_openssh = 0;
@@ -73,10 +76,12 @@ void btkg_context_init(btkg_context_t *context)
 	context->total = 0;
 	context->credentials_idx = 0;
 	context->targets_idx = 0;
+	context->proxies_idx = 0;
 	pthread_mutex_init(&context->lock, NULL);
 
 	btkg_credentials_list_init(&context->credentials);
 	btkg_target_list_init(&context->targets);
+	btkg_proxy_list_init(&context->proxies);
 }
 
 /**
@@ -102,6 +107,9 @@ void btkg_context_destroy(btkg_context_t *context)
 
 	// Free the target list
 	btkg_target_list_destroy(&context->targets);
+
+	// Free the proxy list	
+	btkg_proxy_list_free(&context->proxies);
 
 	// Free any dynamically allocated memory in the context
 	if (context->output != NULL) {
