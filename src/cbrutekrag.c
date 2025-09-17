@@ -46,6 +46,7 @@ SOFTWARE.
 #include "credentials.h"
 #include "detection.h"
 #include "log.h"
+#include "proxy_list.h"
 #include "progress.h"
 #include "str.h"
 #include "target.h"
@@ -74,7 +75,9 @@ static struct option long_options[] = {
 	{ "allow-non-openssh", no_argument, NULL, 'a' },
 	{ "allow-honeypots", no_argument, NULL, 'A' },
 	{ "timeout", required_argument, NULL, 11 },
+	{ "proxy", optional_argument, NULL, 12 },
 	{ "check-http", optional_argument, NULL, 13 },
+	{ "proxy-timeout", required_argument, NULL, 14 },
 	{ NULL, 0, NULL, 0 }
 };
 
@@ -194,6 +197,7 @@ int main(int argc, char **argv)
 
 	btkg_target_list_t *targets = &context.targets;
 	btkg_credentials_list_t *credentials = &context.credentials;
+	btkg_proxy_list_t *proxies = &context.proxies;
 
 	while ((opt = getopt_long(argc, argv, "aAT:C:t:o:f:O:F:DsvVPh",
 				  long_options, &option_index)) != -1) {
@@ -260,12 +264,24 @@ int main(int argc, char **argv)
 				}
 				options->timeout = tempint;
 				break;
+			case 12:
+				btkg_proxy_list_load_from_file( optarg, proxies);
+				options->proxy = 1;
+				break;				
 			case 13:
 				options->check_http =
 					strdup((!OPTIONAL_ARGUMENT_IS_PRESENT) ?
 						       "wwww.google.com" :
 						       optarg);
 				break;
+            case 14: // --proxy-timeout
+                tempint = atoi(optarg);
+                if (tempint < 1) {
+                    log_error("Invalid proxy-timeout value. (%d)", tempint);
+                    exit(EXIT_FAILURE);
+                }
+                options->proxy_timeout = tempint;
+                break;
 			case 'h':
 				print_banner();
 				usage(argv[0]);
@@ -335,9 +351,15 @@ int main(int argc, char **argv)
 	printf("Number of targets: %zu\n", targets->length);
 	printf("Total attempts: %zu\n", context.total);
 	printf("Max threads: %zu\n\n", options->max_threads);
+	printf("Number of all proxies: %zu\n", proxies->count);
 
 	if (context.total == 0) {
 		log_error("No work to do.");
+		exit(EXIT_FAILURE);
+	}
+
+	if (options->proxy && proxies->count == 0){
+		log_error("Proxy list is empty. do not try --proxy ");
 		exit(EXIT_FAILURE);
 	}
 
