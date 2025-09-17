@@ -134,8 +134,11 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
 
     int timeout = BTKG_PROXY_DEFAULT_TIMEOUT;
     if (context != NULL) {
-        /* safe access: context->options.timeout exists in your code */
-        timeout = context->options.timeout ? context->options.timeout : timeout;
+        /* prefer proxy_timeout if set, else fall back to general timeout */
+        if (context->options.proxy_timeout)
+            timeout = context->options.proxy_timeout;
+        else if (context->options.timeout)
+            timeout = context->options.timeout;
     }
 
     int sock = -1;
