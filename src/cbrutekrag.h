@@ -28,17 +28,20 @@ SOFTWARE.
 
 #include "credentials.h"
 #include "target.h"
+#include "proxy_list.h"
 
 #define CBRUTEKRAG_VERBOSE_MODE 0x1
 #define CBRUTEKRAG_VERBOSE_SSHLIB 0x2
 
 typedef struct {
 	int timeout;
+	int proxy_timeout;
 	size_t max_threads;
 	int progress_bar;
 	int verbose;
 	int dry_run;
 	int perform_scan;
+	int proxy;
 	int non_openssh;
 	int allow_honeypots;
 	char *check_http;
@@ -50,11 +53,13 @@ typedef struct {
 	btkg_options_t options;
 	btkg_credentials_list_t credentials;
 	btkg_target_list_t targets;
+	btkg_proxy_list_t proxies;
 	size_t count;
 	size_t successful;
 	size_t total;
 	size_t credentials_idx;
 	size_t targets_idx;
+	size_t proxies_idx;
 	FILE *output;
 	FILE *scan_output;
 	pthread_mutex_t lock;
