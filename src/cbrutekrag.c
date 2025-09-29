@@ -41,6 +41,7 @@ SOFTWARE.
 
 #include <pthread.h>
 
+#include "bruteforce_proxy_ssh.h"
 #include "bruteforce_ssh.h"
 #include "cbrutekrag.h"
 #include "credentials.h"
@@ -463,6 +464,12 @@ int main(int argc, char **argv)
 
 	btkg_progress_watcher_start(&context, &progress_watcher);
 
+	if (option->proxy){
+		btkg_bruteforce_start_proxy(&context);
+	}
+	else{
+		btkg_bruteforce_start(&context);
+	}
 	btkg_bruteforce_start(&context);
 
 	btkg_progress_watcher_wait(&progress_watcher);
