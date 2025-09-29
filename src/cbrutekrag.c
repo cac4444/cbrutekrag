@@ -464,7 +464,7 @@ int main(int argc, char **argv)
 
 	btkg_progress_watcher_start(&context, &progress_watcher);
 
-	if (option->proxy){
+	if (options->proxy){
 		btkg_bruteforce_start_proxy(&context);
 	}
 	else{
