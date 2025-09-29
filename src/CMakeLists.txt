@@ -13,6 +13,9 @@ set(SOURCE_FILES
     progress.c
     progressbar.c
     bruteforce_ssh.c
+    bruteforce_proxy_ssh.c
+    proxy_list.c
+    proxy.c
     detection.c
     target.c
     credentials.c
