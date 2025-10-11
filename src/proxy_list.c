@@ -69,9 +69,8 @@ static int parse_ipv4_port(const char *line, char *ip_out /* len >=16 */, uint16
     if (p < 1 || p > 65535) return 0;
 
     /* success */
-    strncpy(ip_out, ipbuf, 16);
-    ip_out[15] = '\0';
-    *port_out = (uint16_t)p; /* host order */
+    snprintf(ip_out, 16, "%s", ipbuf);  /* safe, always null-terminates */
+    *port_out = (uint16_t)p;            /* host order */
     return 1;
 }
 
