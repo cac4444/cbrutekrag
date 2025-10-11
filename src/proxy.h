@@ -3,12 +3,12 @@
 
 #include <stdint.h>
 
+/* include the project header that defines btkg_context_t (complete type) */
+#include "cbrutekrag.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/* forward-declare context to avoid forcing header inclusion */
-typedef struct btkg_context_s btkg_context_t;
 
 /*
  * Establish a TCP connection to `proxy_ip:proxy_port`, perform SOCKS5 handshake
@@ -20,12 +20,16 @@ typedef struct btkg_context_s btkg_context_t;
  * Notes:
  *  - proxy_ip must be an IPv4 numeric string (e.g. "1.2.3.4").
  *  - dest_host may be an IPv4 string or a domain name.
- *  - Uses context->options.timeout (seconds) as timeout if context != NULL.
+ *  - Uses context->options.proxy_timeout (if context != NULL) or falls back to default.
  */
 int btkg_proxy_socks5_connect(btkg_context_t *context,
                               const char *proxy_ip, uint16_t proxy_port,
                               const char *dest_host, uint16_t dest_port,
                               int *out_fd);
+
+/* Optional: the two-step helpers described previously */
+int btkg_proxy_tcp_connect(const char *proxy_ip, uint16_t proxy_port, int *out_fd);
+int btkg_proxy_socks5_request_connect(int sockfd, const char *dest_host, uint16_t dest_port);
 
 #ifdef __cplusplus
 }
