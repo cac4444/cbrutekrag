@@ -44,10 +44,11 @@ static char *trim(char *s) {
 }
 
 /* validate IPv4 string and numeric port string; on success, fill ip_out and port_out */
-static int parse_ipv4_port(const char *line, char *ip_out /* len >=16 */, uint16_t *port_out) {
+static int parse_ipv4_port(const char *line, char *ip_out /* >=16 */, uint16_t *port_out) {
     if (!line || !ip_out || !port_out) return 0;
+
     const char *colon = strchr(line, ':');
-    if (!colon) return 0;
+    if (!colon) return 0; /* must have :port */
 
     size_t ip_len = (size_t)(colon - line);
     if (ip_len == 0 || ip_len >= 16) return 0;
@@ -56,21 +57,19 @@ static int parse_ipv4_port(const char *line, char *ip_out /* len >=16 */, uint16
     memcpy(ipbuf, line, ip_len);
     ipbuf[ip_len] = '\0';
 
-    struct in_addr a;
-    if (inet_pton(AF_INET, ipbuf, &a) != 1) return 0;
+    /* validate IPv4 */
+    struct in_addr ina;
+    if (inet_pton(AF_INET, ipbuf, &ina) != 1) return 0;
 
-    const char *port_str = colon + 1;
-    if (*port_str == '\0') return 0;
-
+    /* parse port */
+    const char *port_s = colon + 1;
+    if (*port_s == '\0') return 0;
     char *endptr = NULL;
-    errno = 0;
-    long p = strtol(port_str, &endptr, 10);
-    if (errno != 0 || endptr == port_str || *endptr != '\0') return 0;
-    if (p < 1 || p > 65535) return 0;
+    long p = strtol(port_s, &endptr, 10);
+    if (endptr == port_s || *endptr != '\0' || p < 1 || p > 65535) return 0;
 
-    /* success */
-    snprintf(ip_out, 16, "%s", ipbuf);  /* safe, always null-terminates */
-    *port_out = (uint16_t)p;            /* host order */
+    snprintf(ip_out, 16, "%s", ipbuf);
+    *port_out = (uint16_t)p;
     return 1;
 }
 
@@ -106,35 +105,34 @@ int btkg_proxy_list_append(btkg_proxy_list_t *list, const char *ip_str, uint16_t
 
 int btkg_proxy_list_load_from_file(const char *filename, btkg_proxy_list_t *list) {
     if (!filename || !list) return -1;
-
     FILE *f = fopen(filename, "r");
     if (!f) return -1;
 
     char *line = NULL;
-    size_t linelen = 0;
+    size_t len = 0;
     ssize_t nread;
-    int appended = 0;
+    int added = 0;
 
-    while ((nread = getline(&line, &linelen, f)) != -1) {
+    while ((nread = getline(&line, &len, f)) != -1) {
         if (nread <= 0) continue;
         char *trimmed = trim(line);
-        if (trimmed[0] == '\0') continue; /* skip blank */
-        if (trimmed[0] == '#') continue;  /* skip comments */
+        if (trimmed[0] == '\0') continue;
+        if (trimmed[0] == '#') continue;
 
-        /* safety: trimmed should be short */
-        if (strlen(trimmed) >= 64) continue; /* too long line, skip */
-
+        /* parse ip:port */
         char ipbuf[16];
         uint16_t port;
         if (!parse_ipv4_port(trimmed, ipbuf, &port)) {
-            /* invalid, skip */
+            log_error("Skipping invalid proxy line: '%s'", trimmed);
             continue;
         }
 
+        /* append to list: use your btkg_proxy_list_append that accepts ip+port */
         if (btkg_proxy_list_append(list, ipbuf, port) == 0) {
-            appended++;
+            added++;
         } else {
-            /* OOM or fatal: clean up and return -1 */
+            log_error("Failed to append proxy %s:%u (OOM?)", ipbuf, (unsigned)port);
+            /* if append fails fatally, clean up and return -1 */
             free(line);
             fclose(f);
             return -1;
@@ -143,5 +141,5 @@ int btkg_proxy_list_load_from_file(const char *filename, btkg_proxy_list_t *list
 
     free(line);
     fclose(f);
-    return appended;
+    return added;
 }
