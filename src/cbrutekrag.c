@@ -76,7 +76,7 @@ static struct option long_options[] = {
 	{ "allow-non-openssh", no_argument, NULL, 'a' },
 	{ "allow-honeypots", no_argument, NULL, 'A' },
 	{ "timeout", required_argument, NULL, 11 },
-	{ "proxy", optional_argument, NULL, 12 },
+	{ "proxy", required_argument, NULL, 12 },
 	{ "check-http", optional_argument, NULL, 13 },
 	{ "proxy-timeout", required_argument, NULL, 14 },
 	{ NULL, 0, NULL, 0 }
