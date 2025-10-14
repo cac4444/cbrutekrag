@@ -19,8 +19,8 @@ void btkg_proxy_list_init(btkg_proxy_list_t *list) {
     if (!list) return;
     list->count = 0;
     list->capacity = BTKG_PROXY_LIST_INITIAL_CAP;
-    list->items = calloc(list->capacity, sizeof(btkg_proxy_t));
-    if (list->items == NULL) {
+    list->proxies = calloc(list->capacity, sizeof(btkg_proxy_t));
+    if (list->proxies == NULL) {
         log_error("btkg_proxy_list_init: calloc failed");
         list->capacity = 0;
     } else {
@@ -30,9 +30,9 @@ void btkg_proxy_list_init(btkg_proxy_list_t *list) {
 
 void btkg_proxy_list_free(btkg_proxy_list_t *list) {
     if (!list) return;
-    if (list->items) {
-        free(list->items);
-        list->items = NULL;
+    if (list->proxies) {
+        free(list->proxies);
+        list->proxies = NULL;
     }
     list->count = 0;
     list->capacity = 0;
@@ -122,10 +122,10 @@ int btkg_proxy_list_append(btkg_proxy_list_t *list, const char *ip_str, uint16_t
         return -1;
     }
 
-    if (!list->items) {
+    if (!list->proxies) {
         list->capacity = BTKG_PROXY_LIST_INITIAL_CAP;
-        list->items = calloc(list->capacity, sizeof(btkg_proxy_t));
-        if (!list->items) {
+        list->proxies = calloc(list->capacity, sizeof(btkg_proxy_t));
+        if (!list->proxies) {
             log_error("btkg_proxy_list_append: calloc failed");
             list->capacity = 0;
             return -1;
@@ -134,17 +134,17 @@ int btkg_proxy_list_append(btkg_proxy_list_t *list, const char *ip_str, uint16_t
 
     if (list->count >= list->capacity) {
         size_t newcap = list->capacity ? list->capacity * 2 : BTKG_PROXY_LIST_INITIAL_CAP;
-        btkg_proxy_t *tmp = realloc(list->items, newcap * sizeof(btkg_proxy_t));
+        btkg_proxy_t *tmp = realloc(list->proxies, newcap * sizeof(btkg_proxy_t));
         if (!tmp) {
             log_error("btkg_proxy_list_append: realloc failed");
             return -1;
         }
-        list->items = tmp;
+        list->proxies = tmp;
         list->capacity = newcap;
         log_debug("btkg_proxy_list_append: increased capacity to %zu", list->capacity);
     }
 
-    btkg_proxy_t *dst = &list->items[list->count++];
+    btkg_proxy_t *dst = &list->proxies[list->count++];
     snprintf(dst->ip, sizeof(dst->ip), "%s", ip_str);
     dst->port = port;
 
