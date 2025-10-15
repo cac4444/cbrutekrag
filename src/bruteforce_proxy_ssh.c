@@ -18,7 +18,6 @@
 #include "proxy.h"
 
 #define MAX_IP_LEN 16
-#define MAX_HOSTNAME_LEN 256
 
 int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 			       uint16_t port, const char *username,
@@ -260,27 +259,6 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 		btkg_target_t *target = &targets->targets[context->targets_idx++];
 		btkg_credentials_t *combo = &credentials->credentials[context->credentials_idx];
 
-		/* CRITICAL FIX: Copy ALL data to local stack BEFORE unlocking to prevent race conditions */
-		char target_host[256];  /* Need full size for domain names */
-		uint16_t target_port;
-		char username[33];      /* LOGIN_NAME_MAX + 1 */
-		char password[101];     /* LOGIN_PASS_MAX + 1 */
-		
-		/* Safely copy target data */
-		size_t host_len = strnlen(target->host, 255);
-		memcpy(target_host, target->host, host_len);
-		target_host[host_len] = '\0';
-		target_port = target->port;
-		
-		/* Safely copy credentials - use actual buffer sizes */
-		size_t user_len = strnlen(combo->username, 32);
-		memcpy(username, combo->username, user_len);
-		username[user_len] = '\0';
-		
-		size_t pass_len = strnlen(combo->password, 100);
-		memcpy(password, combo->password, pass_len);
-		password[pass_len] = '\0';
-
 		/* CRITICAL FIX: Copy proxy data to local variables BEFORE unlocking */
 		char proxy_ip_copy[MAX_IP_LEN];
 		uint16_t proxy_port_copy = 0;
@@ -320,30 +298,22 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 
 		context->count++;
 		pthread_mutex_unlock(&context->lock);
-		/* NOW it's safe to use all copied data */
+		/* NOW it's safe to use proxy_ip_copy and proxy_port_copy */
 
 		if (!have_proxy) {
 			if (!options->dry_run) {
 				log_debug("No proxy configured; skipping attempt for %s:%d", 
-					target_host, target_port);
+					target->host, target->port);
 				continue;
 			}
 		}
 
 		if (!options->dry_run) {
-			log_debug("Thread attempting: %s:%d via proxy %s:%u", 
-				target_host, target_port, 
-				have_proxy ? proxy_ip_copy : "none", proxy_port_copy);
-				
 			int ret = bruteforce_ssh_try_login_proxy(context,
-					target_host, target_port,
-					username, password,
+					target->host, target->port,
+					combo->username, combo->password,
 					have_proxy ? proxy_ip_copy : NULL, 
 					proxy_port_copy);
-					
-			log_debug("Thread completed attempt: %s:%d result=%d", 
-				target_host, target_port, ret);
-				
 			if (ret == 0) {
 				pthread_mutex_lock(&context->lock);
 				context->successful++;
@@ -352,8 +322,8 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 		} else {
 			const char *proxy_str = have_proxy ? proxy_ip_copy : "no-proxy";
 			log_debug("\033[38m[-]\033[0m %s:%d %s %s (proxy=%s:%u)",
-				  target_host, target_port, username,
-				  password, proxy_str, (unsigned)proxy_port_copy);
+				  target->host, target->port, combo->username,
+				  combo->password, proxy_str, (unsigned)proxy_port_copy);
 		}
 	}
 
@@ -362,40 +332,43 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 
 void btkg_bruteforce_start_proxy(btkg_context_t *context)
 {
+    if (!context) {
+        log_error("btkg_bruteforce_start_proxy: NULL context");
+        return;
+    }
+
     btkg_options_t *options = &context->options;
-    
-    /* Create thread attributes with reduced stack size */
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    
-    /* Critical: Set stack size to 2MB per thread (down from default 8MB)
-     * This allows creating 2000+ threads without exhausting virtual memory
-     * 2MB is needed for: local buffers (1.5KB), libssh internals, proxy SOCKS5 buffers */
-    size_t stack_size = 2 * 1024 * 1024;  /* 2MB */
-    if (pthread_attr_setstacksize(&attr, stack_size) != 0) {
-        log_error("CRITICAL: Failed to set thread stack size - may crash with many threads!");
-    } else {
-        log_info("Set thread stack size to %zu KB per thread", stack_size / 1024);
-    }
-    
-    pthread_t scan_threads[options->max_threads];
-    int ret;
+    size_t nthreads = options->max_threads ? options->max_threads : 1;
 
-    for (size_t i = 0; i < options->max_threads; i++) {
+    const size_t SANE_MAX = 16384;
+    if (nthreads > SANE_MAX) {
+        log_error("Requested %zu threads exceeds sane cap %zu; capping.", nthreads, SANE_MAX);
+        nthreads = SANE_MAX;
+    }
+
+    pthread_t *threads = calloc(nthreads, sizeof(pthread_t));
+    if (!threads) {
+        log_error("btkg_bruteforce_start_proxy: out of memory allocating %zu pthread_t entries", nthreads);
+        return;
+    }
+
+    size_t created = 0;
+    for (size_t i = 0; i < nthreads; ++i) {
         log_debug("Creating thread (proxy): %zu", i);
-        if ((ret = pthread_create(&scan_threads[i], &attr, 
-                                  btkg_bruteforce_worker_proxy,
-                                  (void *)context))) {
-            log_error("Thread creation failed: %d", ret);
+        int rc = pthread_create(&threads[i], NULL, btkg_bruteforce_worker_proxy, (void *)context);
+        if (rc != 0) {
+            log_error("btkg_bruteforce_start_proxy: pthread_create failed for thread %zu: %s", i, strerror(rc));
+            break;
+        }
+        created++;
+    }
+
+    for (size_t i = 0; i < created; ++i) {
+        int rc = pthread_join(threads[i], NULL);
+        if (rc != 0) {
+            log_error("btkg_bruteforce_start_proxy: pthread_join failed for thread %zu: %s", i, strerror(rc));
         }
     }
 
-    pthread_attr_destroy(&attr);
-
-    for (size_t i = 0; i < options->max_threads; i++) {
-        ret = pthread_join(scan_threads[i], NULL);
-        if (ret != 0) {
-            log_error("Cannot join thread no: %d", ret);
-        }
-    }
+    free(threads);
 }
