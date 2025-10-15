@@ -1,31 +1,104 @@
 /*
- adapted bruteforce_proxy_ssh.c - proxy arg variant
- - All functions have _proxy suffix
- - Worker reads proxy from context with:
-     btkg_proxy_t *pxy = &proxies->proxies[context->proxies_idx];
- - The worker passes pxy->ip and pxy->port to try/login functions
- - Functions changed:
-     int bruteforce_ssh_login_proxy(..., const char *proxy_ip, uint16_t proxy_port)
-     int bruteforce_ssh_try_login_proxy(..., const char *proxy_ip, uint16_t proxy_port)
-*/
+ * bruteforce_proxy_ssh.c
+ * Proxy-aware bruteforce worker variant.
+ *
+ * - Uses btkg_proxy_get_next() for thread-safe proxy selection.
+ * - Validates proxy canary and IP before use; aborts on corruption so sanitizer/gdb
+ *   can capture an immediate stack trace.
+ * - Allocates thread array on heap to avoid stack bloat.
+ *
+ * Note: This file expects the following headers/types to exist in your project:
+ *   - cbrutekrag.h (defines btkg_context_t, btkg_options_t, etc.)
+ *   - proxy_list.h (defines btkg_proxy_list_t, btkg_proxy_t, BTKG_PROXY_CANARY)
+ *   - log.h (log_error, log_info, log_debug, log_warn)
+ *
+ */
+
+#define _POSIX_C_SOURCE 200809L
 
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h> /* close */
 #include <stdlib.h>
+#include <pthread.h>
 
 #include <libssh/libssh.h>
-#include <pthread.h>
 
 #include "cbrutekrag.h"
 #include "log.h"
-#include "proxy.h"
+#include "proxy_list.h"
+#include "proxy.h" /* for btkg_proxy_socks5_connect prototype */
 
-/* Prototypes */
+/* Forward declarations (if any) */
 
+/* --------------------------------------------------------------------------
+ * Thread-safe proxy accessor
+ *
+ * Returns pointer to a proxy entry owned by context->proxies (do not free).
+ * If no proxies configured returns NULL.
+ *
+ * This function:
+ *  - holds context->lock while reading and advancing the index
+ *  - ensures the index is within bounds (repairs and logs otherwise)
+ *  - validates the entry's canary and basic contents (ip not empty)
+ *  - aborts on corruption so sanitizers / gdb can capture a precise backtrace
+ * -------------------------------------------------------------------------- */
+static btkg_proxy_t *btkg_proxy_get_next(btkg_context_t *context)
+{
+	if (!context) return NULL;
 
-/* Attempt to brute-force SSH login using proxy (proxy ip/port passed explicitly) */
+	btkg_proxy_list_t *pl = &context->proxies;
+	btkg_proxy_t *px = NULL;
+
+	pthread_mutex_lock(&context->lock);
+
+	/* no proxies configured */
+	if (pl->proxies == NULL || pl->count == 0) {
+		pthread_mutex_unlock(&context->lock);
+		return NULL;
+	}
+
+	/* repair corrupted index if necessary */
+	if (context->proxies_idx >= pl->count) {
+		log_error("btkg_proxy_get_next: proxies_idx %zu >= count %zu; resetting to 0",
+			  context->proxies_idx, pl->count);
+		context->proxies_idx = 0;
+	}
+
+	size_t idx = context->proxies_idx;
+	px = &pl->proxies[idx];
+
+	/* advance index for next caller (wrap) */
+	context->proxies_idx = (idx + 1) % pl->count;
+
+	pthread_mutex_unlock(&context->lock);
+
+	/* Validate entry canary and ip */
+	if (px->canary != BTKG_PROXY_CANARY) {
+		log_error("btkg_proxy_get_next: proxy canary corrupted at idx=%zu (canary=0x%08x). Aborting.",
+			  idx, (unsigned)px->canary);
+		abort(); /* immediate core for gdb / sanitizer */
+	}
+
+	if (px->ip[0] == '\0') {
+		log_error("btkg_proxy_get_next: proxy IP empty at idx=%zu. Aborting.", idx);
+		abort();
+	}
+
+	return px;
+}
+
+/* --------------------------------------------------------------------------
+ * bruteforce_ssh_login_proxy
+ *
+ * Establishes a proxied TCP tunnel to hostname:port via SOCKS5 proxy and
+ * performs the libssh login flow using the proxied fd.
+ * Returns:
+ *   0  => success (valid credentials)
+ *  -1  => normal failure (bad creds / connection)
+ *  -2..-6 => different fatal errors (kept similar to original)
+ * -------------------------------------------------------------------------- */
 int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 			       uint16_t port, const char *username,
 			       const char *password,
@@ -136,6 +209,7 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 
 				char buffer[1024];
 				int nbytes;
+				/* safe formatting into buffer */
 				snprintf(buffer, sizeof(buffer),
 					 "GET / HTTP/1.1\r\nHost: %s\r\n\r\n",
 					 options->check_http);
@@ -197,7 +271,10 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 	return -1;
 }
 
-/* Wrapper for trying login; passes proxy ip/port */
+/* --------------------------------------------------------------------------
+ * bruteforce_ssh_try_login_proxy
+ * Wrapper that adapts $TARGET substitution and logs successes.
+ * -------------------------------------------------------------------------- */
 int bruteforce_ssh_try_login_proxy(btkg_context_t *context, const char *hostname,
 				   const uint16_t port, const char *username,
 				   const char *password,
@@ -223,10 +300,16 @@ int bruteforce_ssh_try_login_proxy(btkg_context_t *context, const char *hostname
 	return ret;
 }
 
-/* Worker function (proxy variant) - now reads proxy entry and passes its ip/port */
+/* --------------------------------------------------------------------------
+ * Worker function (proxy variant)
+ * - Fetches work items in a loop
+ * - Uses btkg_proxy_get_next() to select proxies safely
+ * -------------------------------------------------------------------------- */
 static void *btkg_bruteforce_worker_proxy(void *ptr)
 {
 	btkg_context_t *context = (btkg_context_t *)ptr;
+	if (!context) return NULL;
+
 	btkg_target_list_t *targets = &context->targets;
 	btkg_credentials_list_t *credentials = &context->credentials;
 	btkg_proxy_list_t *proxies = &context->proxies;
@@ -235,18 +318,15 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 	for (;;) {
 		pthread_mutex_lock(&context->lock);
 
-		/* If we've exhausted targets for the current credential, advance credential and
-		   also advance proxy index (wrap-around). Keep these index ops under the lock. */
+		/* If we've exhausted targets for the current credential, advance credential
+		   and also advance proxy index (wrap-around). Keep these index ops under the lock. */
 		if (context->targets_idx >= targets->length) {
 			context->targets_idx = 0;
 			context->credentials_idx++;
 
-			/* whenever credential index is increased, advance proxy index too */
+			/* whenever credential index is increased, advance proxy index too (defensive) */
 			if (proxies->count > 0) {
-				context->proxies_idx++;
-				if (context->proxies_idx >= proxies->count) {
-					context->proxies_idx = 0;
-				}
+				context->proxies_idx = (context->proxies_idx + 1) % proxies->count;
 			}
 		}
 
@@ -256,35 +336,25 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 			break;
 		}
 
-		/* fetch work item (target + credential + proxy) while holding lock */
+		/* fetch work item (target + credential) while holding lock */
 		btkg_target_t *target = &targets->targets[context->targets_idx++];
 		btkg_credentials_t *combo = &credentials->credentials[context->credentials_idx];
 
-		/* read proxy entry at current index (do not modify proxy index here;
-		   we've already advanced it above on credential-rollover). This
-		   follows your requested pattern:
-		     btkg_proxy_t *pxy = &proxies->proxies[context->proxies_idx];
-		*/
-		btkg_proxy_t *pxy = NULL;
-		if (proxies->count > 0) {
-			/* defensive check: if index out of range, wrap it */
-			if (context->proxies_idx >= proxies->count) {
-				context->proxies_idx = 0;
-			}
-			pxy = &proxies->proxies[context->proxies_idx];
-		}
-
+		/* increment global attempt counter */
 		context->count++;
+
 		pthread_mutex_unlock(&context->lock);
 
-		/* prepare proxy args to pass */
+		/* select proxy (thread-safe) - may return NULL if no proxies configured */
+		btkg_proxy_t *pxy = btkg_proxy_get_next(context);
+
 		const char *proxy_ip = NULL;
 		uint16_t proxy_port = 0;
-		if (pxy) {
+		if (pxy != NULL) {
 			proxy_ip = pxy->ip;
 			proxy_port = pxy->port;
 		} else {
-			/* If no proxy configured, you can decide how to behave. Here we skip attempts. */
+			/* No proxies configured - behavior: skip attempt when not dry run */
 			if (!options->dry_run) {
 				log_debug("No proxy configured; skipping attempt for %s:%d", target->host, target->port);
 				continue;
@@ -312,27 +382,42 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 	return NULL;
 }
 
-/* Start brute-force (proxy variant) */
+/* --------------------------------------------------------------------------
+ * Start brute-force (proxy variant)
+ * - Allocates thread array on heap
+ * -------------------------------------------------------------------------- */
 void btkg_bruteforce_start_proxy(btkg_context_t *context)
 {
+	if (!context) return;
 	btkg_options_t *options = &context->options;
 
-	pthread_t scan_threads[options->max_threads];
+	/* guard: don't try to create absurd amount of threads without sanity */
+	if (options->max_threads == 0) {
+		log_error("btkg_bruteforce_start_proxy: max_threads is 0");
+		return;
+	}
+
+	pthread_t *scan_threads = calloc(options->max_threads, sizeof(pthread_t));
+	if (!scan_threads) {
+		log_error("btkg_bruteforce_start_proxy: failed to allocate thread array (count=%zu)", options->max_threads);
+		return;
+	}
+
 	int ret;
-
-	for (size_t i = 0; i < options->max_threads; i++) {
-		log_debug("Creating thread (proxy): %ld", i);
-		if ((ret = pthread_create(&scan_threads[i], NULL,
-					  btkg_bruteforce_worker_proxy,
-					  (void *)context))) {
-			log_error("Thread creation failed: %d\n", ret);
-		}
-	}
-
-	for (size_t i = 0; i < options->max_threads; i++) {
-		ret = pthread_join(scan_threads[i], NULL);
+	for (size_t i = 0; i < (size_t)options->max_threads; i++) {
+		log_debug("Creating thread (proxy): %zu", i);
+		ret = pthread_create(&scan_threads[i], NULL, btkg_bruteforce_worker_proxy, (void *)context);
 		if (ret != 0) {
-			log_error("Cannot join thread no: %d\n", ret);
+			log_error("Thread creation failed: %d", ret);
 		}
 	}
+
+	for (size_t i = 0; i < (size_t)options->max_threads; i++) {
+		int jret = pthread_join(scan_threads[i], NULL);
+		if (jret != 0) {
+			log_error("Cannot join thread no: %d", jret);
+		}
+	}
+
+	free(scan_threads);
 }
