@@ -261,23 +261,23 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 		btkg_credentials_t *combo = &credentials->credentials[context->credentials_idx];
 
 		/* CRITICAL FIX: Copy ALL data to local stack BEFORE unlocking to prevent race conditions */
-		char target_host[128];  /* Reduced from 256 to save stack space */
+		char target_host[256];  /* Need full size for domain names */
 		uint16_t target_port;
-		char username[32];      /* Reduced from 64 to save stack space */
-		char password[32];      /* Reduced from 64 to save stack space */
+		char username[128];     /* SSH usernames can be long */
+		char password[128];     /* Passwords can be long */
 		
 		/* Safely copy target data */
-		size_t host_len = strnlen(target->host, 127);  /* 128-1 */
+		size_t host_len = strnlen(target->host, 255);
 		memcpy(target_host, target->host, host_len);
 		target_host[host_len] = '\0';
 		target_port = target->port;
 		
 		/* Safely copy credentials */
-		size_t user_len = strnlen(combo->username, 31);  /* 32-1 */
+		size_t user_len = strnlen(combo->username, 127);
 		memcpy(username, combo->username, user_len);
 		username[user_len] = '\0';
 		
-		size_t pass_len = strnlen(combo->password, 31);  /* 32-1 */
+		size_t pass_len = strnlen(combo->password, 127);
 		memcpy(password, combo->password, pass_len);
 		password[pass_len] = '\0';
 
@@ -331,11 +331,19 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 		}
 
 		if (!options->dry_run) {
+			log_debug("Thread attempting: %s:%d via proxy %s:%u", 
+				target_host, target_port, 
+				have_proxy ? proxy_ip_copy : "none", proxy_port_copy);
+				
 			int ret = bruteforce_ssh_try_login_proxy(context,
 					target_host, target_port,
 					username, password,
 					have_proxy ? proxy_ip_copy : NULL, 
 					proxy_port_copy);
+					
+			log_debug("Thread completed attempt: %s:%d result=%d", 
+				target_host, target_port, ret);
+				
 			if (ret == 0) {
 				pthread_mutex_lock(&context->lock);
 				context->successful++;
