@@ -1,18 +1,13 @@
 /*
- adapted bruteforce_proxy_ssh.c - proxy arg variant
- - All functions have _proxy suffix
- - Worker reads proxy from context with:
-     btkg_proxy_t *pxy = &proxies->proxies[context->proxies_idx];
- - The worker passes pxy->ip and pxy->port to try/login functions
- - Functions changed:
-     int bruteforce_ssh_login_proxy(..., const char *proxy_ip, uint16_t proxy_port)
-     int bruteforce_ssh_try_login_proxy(..., const char *proxy_ip, uint16_t proxy_port)
+ adapted bruteforce_proxy_ssh.c - proxy arg variant (FIXED)
+ - Fixed race condition: proxy data is copied while holding lock
+ - Fixed buffer overflow: IP/port copied to local variables before unlock
 */
 
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h> /* close */
+#include <unistd.h>
 #include <stdlib.h>
 
 #include <libssh/libssh.h>
@@ -22,10 +17,8 @@
 #include "log.h"
 #include "proxy.h"
 
-/* Prototypes */
+#define MAX_IP_LEN 16
 
-
-/* Attempt to brute-force SSH login using proxy (proxy ip/port passed explicitly) */
 int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 			       uint16_t port, const char *username,
 			       const char *password,
@@ -54,7 +47,6 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 	}
 
 	int proxied_fd = -1;
-	/* Use proxy helper to establish proxied TCP connection to hostname:port */
 	if (btkg_proxy_socks5_connect(context, proxy_ip, proxy_port,
 				      hostname, port, &proxied_fd) != 0) {
 		log_debug("Failed to connect to %s:%u via proxy %s:%u",
@@ -70,8 +62,6 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 	ssh_options_set(session, SSH_OPTIONS_PORT, &(int){ port });
 	ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeout);
 	ssh_options_set(session, SSH_OPTIONS_USER, username);
-
-	/* Provide already-connected socket FD to libssh so it uses the proxied socket */
 	ssh_options_set(session, SSH_OPTIONS_FD, &proxied_fd);
 
 	int r = ssh_connect(session);
@@ -107,7 +97,6 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 	if (method & (int)SSH_AUTH_METHOD_PASSWORD) {
 		r = ssh_userauth_password(session, NULL, password);
 		if (r == SSH_AUTH_SUCCESS) {
-			/* Credentials accepted */
 			if (options->check_http != NULL) {
 				ssh_channel channel = ssh_channel_new(session);
 				if (channel == NULL) {
@@ -136,6 +125,21 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 
 				char buffer[1024];
 				int nbytes;
+				size_t check_http_len = strlen(options->check_http);
+				
+				/* Prevent buffer overflow from long check_http string */
+				if (check_http_len > 900) {
+					log_error("check_http string too long (%zu bytes)", check_http_len);
+					if (channel) {
+						ssh_channel_close(channel);
+						ssh_channel_free(channel);
+					}
+					ssh_disconnect(session);
+					ssh_free(session);
+					if (proxied_fd >= 0) close(proxied_fd);
+					return -7;
+				}
+
 				snprintf(buffer, sizeof(buffer),
 					 "GET / HTTP/1.1\r\nHost: %s\r\n\r\n",
 					 options->check_http);
@@ -197,7 +201,6 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 	return -1;
 }
 
-/* Wrapper for trying login; passes proxy ip/port */
 int bruteforce_ssh_try_login_proxy(btkg_context_t *context, const char *hostname,
 				   const uint16_t port, const char *username,
 				   const char *password,
@@ -223,7 +226,7 @@ int bruteforce_ssh_try_login_proxy(btkg_context_t *context, const char *hostname
 	return ret;
 }
 
-/* Worker function (proxy variant) - now reads proxy entry and passes its ip/port */
+/* FIXED Worker function - copies proxy data while holding lock */
 static void *btkg_bruteforce_worker_proxy(void *ptr)
 {
 	btkg_context_t *context = (btkg_context_t *)ptr;
@@ -235,13 +238,10 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 	for (;;) {
 		pthread_mutex_lock(&context->lock);
 
-		/* If we've exhausted targets for the current credential, advance credential and
-		   also advance proxy index (wrap-around). Keep these index ops under the lock. */
 		if (context->targets_idx >= targets->length) {
 			context->targets_idx = 0;
 			context->credentials_idx++;
 
-			/* whenever credential index is increased, advance proxy index too */
 			if (proxies->count > 0) {
 				context->proxies_idx++;
 				if (context->proxies_idx >= proxies->count) {
@@ -250,43 +250,41 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 			}
 		}
 
-		/* If we've exhausted credentials -> stop */
 		if (context->credentials_idx >= credentials->length) {
 			pthread_mutex_unlock(&context->lock);
 			break;
 		}
 
-		/* fetch work item (target + credential + proxy) while holding lock */
+		/* Fetch work items while holding lock */
 		btkg_target_t *target = &targets->targets[context->targets_idx++];
 		btkg_credentials_t *combo = &credentials->credentials[context->credentials_idx];
 
-		/* read proxy entry at current index (do not modify proxy index here;
-		   we've already advanced it above on credential-rollover). This
-		   follows your requested pattern:
-		     btkg_proxy_t *pxy = &proxies->proxies[context->proxies_idx];
-		*/
-		btkg_proxy_t *pxy = NULL;
+		/* CRITICAL FIX: Copy proxy data to local variables BEFORE unlocking */
+		char proxy_ip_copy[MAX_IP_LEN] = {0};
+		uint16_t proxy_port_copy = 0;
+		int have_proxy = 0;
+
 		if (proxies->count > 0) {
-			/* defensive check: if index out of range, wrap it */
 			if (context->proxies_idx >= proxies->count) {
 				context->proxies_idx = 0;
 			}
-			pxy = &proxies->proxies[context->proxies_idx];
+			btkg_proxy_t *pxy = &proxies->proxies[context->proxies_idx];
+			
+			/* Copy proxy data to stack variables while we still hold the lock */
+			strncpy(proxy_ip_copy, pxy->ip, MAX_IP_LEN - 1);
+			proxy_ip_copy[MAX_IP_LEN - 1] = '\0';
+			proxy_port_copy = pxy->port;
+			have_proxy = 1;
 		}
 
 		context->count++;
 		pthread_mutex_unlock(&context->lock);
+		/* NOW it's safe to use proxy_ip_copy and proxy_port_copy */
 
-		/* prepare proxy args to pass */
-		const char *proxy_ip = NULL;
-		uint16_t proxy_port = 0;
-		if (pxy) {
-			proxy_ip = pxy->ip;
-			proxy_port = pxy->port;
-		} else {
-			/* If no proxy configured, you can decide how to behave. Here we skip attempts. */
+		if (!have_proxy) {
 			if (!options->dry_run) {
-				log_debug("No proxy configured; skipping attempt for %s:%d", target->host, target->port);
+				log_debug("No proxy configured; skipping attempt for %s:%d", 
+					target->host, target->port);
 				continue;
 			}
 		}
@@ -295,24 +293,24 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 			int ret = bruteforce_ssh_try_login_proxy(context,
 					target->host, target->port,
 					combo->username, combo->password,
-					proxy_ip, proxy_port);
+					have_proxy ? proxy_ip_copy : NULL, 
+					proxy_port_copy);
 			if (ret == 0) {
 				pthread_mutex_lock(&context->lock);
 				context->successful++;
 				pthread_mutex_unlock(&context->lock);
 			}
 		} else {
-			const char *proxy_str = proxy_ip ? proxy_ip : "no-proxy";
+			const char *proxy_str = have_proxy ? proxy_ip_copy : "no-proxy";
 			log_debug("\033[38m[-]\033[0m %s:%d %s %s (proxy=%s:%u)",
 				  target->host, target->port, combo->username,
-				  combo->password, proxy_str, (unsigned)proxy_port);
+				  combo->password, proxy_str, (unsigned)proxy_port_copy);
 		}
 	}
 
 	return NULL;
 }
 
-/* Start brute-force (proxy variant) */
 void btkg_bruteforce_start_proxy(btkg_context_t *context)
 {
     if (!context) {
@@ -323,9 +321,7 @@ void btkg_bruteforce_start_proxy(btkg_context_t *context)
     btkg_options_t *options = &context->options;
     size_t nthreads = options->max_threads ? options->max_threads : 1;
 
-    /* Protect against insane user values to avoid allocating huge arrays.
-     * Adjust SANE_MAX to taste (or derive from rlimits/available memory). */
-    const size_t SANE_MAX = 16384; /* safety cap */
+    const size_t SANE_MAX = 16384;
     if (nthreads > SANE_MAX) {
         log_error("Requested %zu threads exceeds sane cap %zu; capping.", nthreads, SANE_MAX);
         nthreads = SANE_MAX;
@@ -343,12 +339,11 @@ void btkg_bruteforce_start_proxy(btkg_context_t *context)
         int rc = pthread_create(&threads[i], NULL, btkg_bruteforce_worker_proxy, (void *)context);
         if (rc != 0) {
             log_error("btkg_bruteforce_start_proxy: pthread_create failed for thread %zu: %s", i, strerror(rc));
-            break; /* stop trying to create more threads */
+            break;
         }
         created++;
     }
 
-    /* join only the threads that were successfully created */
     for (size_t i = 0; i < created; ++i) {
         int rc = pthread_join(threads[i], NULL);
         if (rc != 0) {
