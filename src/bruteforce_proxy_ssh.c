@@ -263,8 +263,8 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 		/* CRITICAL FIX: Copy ALL data to local stack BEFORE unlocking to prevent race conditions */
 		char target_host[256];  /* Need full size for domain names */
 		uint16_t target_port;
-		char username[128];     /* SSH usernames can be long */
-		char password[128];     /* Passwords can be long */
+		char username[33];      /* LOGIN_NAME_MAX + 1 */
+		char password[101];     /* LOGIN_PASS_MAX + 1 */
 		
 		/* Safely copy target data */
 		size_t host_len = strnlen(target->host, 255);
@@ -272,12 +272,12 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 		target_host[host_len] = '\0';
 		target_port = target->port;
 		
-		/* Safely copy credentials */
-		size_t user_len = strnlen(combo->username, 127);
+		/* Safely copy credentials - use actual buffer sizes */
+		size_t user_len = strnlen(combo->username, 32);
 		memcpy(username, combo->username, user_len);
 		username[user_len] = '\0';
 		
-		size_t pass_len = strnlen(combo->password, 127);
+		size_t pass_len = strnlen(combo->password, 100);
 		memcpy(password, combo->password, pass_len);
 		password[pass_len] = '\0';
 
