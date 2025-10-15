@@ -260,6 +260,27 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 		btkg_target_t *target = &targets->targets[context->targets_idx++];
 		btkg_credentials_t *combo = &credentials->credentials[context->credentials_idx];
 
+		/* CRITICAL FIX: Copy ALL data to local stack BEFORE unlocking to prevent race conditions */
+		char target_host[128];  /* Reduced from 256 to save stack space */
+		uint16_t target_port;
+		char username[32];      /* Reduced from 64 to save stack space */
+		char password[32];      /* Reduced from 64 to save stack space */
+		
+		/* Safely copy target data */
+		size_t host_len = strnlen(target->host, 127);  /* 128-1 */
+		memcpy(target_host, target->host, host_len);
+		target_host[host_len] = '\0';
+		target_port = target->port;
+		
+		/* Safely copy credentials */
+		size_t user_len = strnlen(combo->username, 31);  /* 32-1 */
+		memcpy(username, combo->username, user_len);
+		username[user_len] = '\0';
+		
+		size_t pass_len = strnlen(combo->password, 31);  /* 32-1 */
+		memcpy(password, combo->password, pass_len);
+		password[pass_len] = '\0';
+
 		/* CRITICAL FIX: Copy proxy data to local variables BEFORE unlocking */
 		char proxy_ip_copy[MAX_IP_LEN];
 		uint16_t proxy_port_copy = 0;
@@ -299,20 +320,20 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 
 		context->count++;
 		pthread_mutex_unlock(&context->lock);
-		/* NOW it's safe to use proxy_ip_copy and proxy_port_copy */
+		/* NOW it's safe to use all copied data */
 
 		if (!have_proxy) {
 			if (!options->dry_run) {
 				log_debug("No proxy configured; skipping attempt for %s:%d", 
-					target->host, target->port);
+					target_host, target_port);
 				continue;
 			}
 		}
 
 		if (!options->dry_run) {
 			int ret = bruteforce_ssh_try_login_proxy(context,
-					target->host, target->port,
-					combo->username, combo->password,
+					target_host, target_port,
+					username, password,
 					have_proxy ? proxy_ip_copy : NULL, 
 					proxy_port_copy);
 			if (ret == 0) {
@@ -323,8 +344,8 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 		} else {
 			const char *proxy_str = have_proxy ? proxy_ip_copy : "no-proxy";
 			log_debug("\033[38m[-]\033[0m %s:%d %s %s (proxy=%s:%u)",
-				  target->host, target->port, combo->username,
-				  combo->password, proxy_str, (unsigned)proxy_port_copy);
+				  target_host, target_port, username,
+				  password, proxy_str, (unsigned)proxy_port_copy);
 		}
 	}
 
@@ -339,12 +360,14 @@ void btkg_bruteforce_start_proxy(btkg_context_t *context)
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     
-    /* Critical: Reduce stack size from 8MB to 1MB per thread
+    /* Critical: Set stack size to 2MB per thread (down from default 8MB)
      * This allows creating 2000+ threads without exhausting virtual memory
-     * 1MB is still plenty for SSH operations with proxy */
-    size_t stack_size = 1024 * 1024;  /* 1MB */
+     * 2MB is needed for: local buffers (1.5KB), libssh internals, proxy SOCKS5 buffers */
+    size_t stack_size = 2 * 1024 * 1024;  /* 2MB */
     if (pthread_attr_setstacksize(&attr, stack_size) != 0) {
-        log_warn("Failed to set thread stack size, using default (may cause issues with many threads)");
+        log_error("CRITICAL: Failed to set thread stack size - may crash with many threads!");
+    } else {
+        log_info("Set thread stack size to %zu KB per thread", stack_size / 1024);
     }
     
     pthread_t scan_threads[options->max_threads];
