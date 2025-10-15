@@ -352,16 +352,31 @@ void btkg_bruteforce_start_proxy(btkg_context_t *context)
         return;
     }
 
+    /* Create thread attributes with reduced stack size to prevent stack exhaustion */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    
+    /* Set stack size to 512KB (down from default 8MB) - enough for SSH operations */
+    size_t stack_size = 512 * 1024;
+    int attr_rc = pthread_attr_setstacksize(&attr, stack_size);
+    if (attr_rc != 0) {
+        log_warn("Failed to set thread stack size: %s (using default)", strerror(attr_rc));
+    } else {
+        log_debug("Set thread stack size to %zu KB", stack_size / 1024);
+    }
+
     size_t created = 0;
     for (size_t i = 0; i < nthreads; ++i) {
         log_debug("Creating thread (proxy): %zu", i);
-        int rc = pthread_create(&threads[i], NULL, btkg_bruteforce_worker_proxy, (void *)context);
+        int rc = pthread_create(&threads[i], &attr, btkg_bruteforce_worker_proxy, (void *)context);
         if (rc != 0) {
             log_error("btkg_bruteforce_start_proxy: pthread_create failed for thread %zu: %s", i, strerror(rc));
             break;
         }
         created++;
     }
+
+    pthread_attr_destroy(&attr);
 
     for (size_t i = 0; i < created; ++i) {
         int rc = pthread_join(threads[i], NULL);
