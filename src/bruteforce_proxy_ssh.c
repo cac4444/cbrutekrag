@@ -265,14 +265,31 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 		int have_proxy = 0;
 
 		if (proxies->count > 0) {
+			/* Bounds check before array access */
 			if (context->proxies_idx >= proxies->count) {
 				context->proxies_idx = 0;
 			}
+			
+			/* Additional safety: verify proxies array exists and index is valid */
+			if (!proxies->proxies || context->proxies_idx >= proxies->count) {
+				log_error("Invalid proxy array access: proxies=%p count=%zu idx=%zu",
+					(void*)proxies->proxies, proxies->count, context->proxies_idx);
+				pthread_mutex_unlock(&context->lock);
+				break;
+			}
+			
 			btkg_proxy_t *pxy = &proxies->proxies[context->proxies_idx];
 			
+			/* Verify proxy data is valid before copying */
+			if (pxy->ip[0] == '\0' || pxy->port == 0) {
+				log_error("Invalid proxy data at index %zu: ip='%s' port=%u",
+					context->proxies_idx, pxy->ip, pxy->port);
+				pthread_mutex_unlock(&context->lock);
+				break;
+			}
+			
 			/* Copy proxy data to stack variables while we still hold the lock */
-			size_t len = strlen(pxy->ip);
-			if (len >= MAX_IP_LEN) len = MAX_IP_LEN - 1;
+			size_t len = strnlen(pxy->ip, MAX_IP_LEN - 1);
 			memcpy(proxy_ip_copy, pxy->ip, len);
 			proxy_ip_copy[len] = '\0';
 			proxy_port_copy = pxy->port;
