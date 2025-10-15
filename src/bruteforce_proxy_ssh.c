@@ -315,24 +315,46 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 /* Start brute-force (proxy variant) */
 void btkg_bruteforce_start_proxy(btkg_context_t *context)
 {
-	btkg_options_t *options = &context->options;
+    if (!context) {
+        log_error("btkg_bruteforce_start_proxy: NULL context");
+        return;
+    }
 
-	pthread_t scan_threads[options->max_threads];
-	int ret;
+    btkg_options_t *options = &context->options;
+    size_t nthreads = options->max_threads ? options->max_threads : 1;
 
-	for (size_t i = 0; i < options->max_threads; i++) {
-		log_debug("Creating thread (proxy): %ld", i);
-		if ((ret = pthread_create(&scan_threads[i], NULL,
-					  btkg_bruteforce_worker_proxy,
-					  (void *)context))) {
-			log_error("Thread creation failed: %d\n", ret);
-		}
-	}
+    /* Protect against insane user values to avoid allocating huge arrays.
+     * Adjust SANE_MAX to taste (or derive from rlimits/available memory). */
+    const size_t SANE_MAX = 16384; /* safety cap */
+    if (nthreads > SANE_MAX) {
+        log_error("Requested %zu threads exceeds sane cap %zu; capping.", nthreads, SANE_MAX);
+        nthreads = SANE_MAX;
+    }
 
-	for (size_t i = 0; i < options->max_threads; i++) {
-		ret = pthread_join(scan_threads[i], NULL);
-		if (ret != 0) {
-			log_error("Cannot join thread no: %d\n", ret);
-		}
-	}
+    pthread_t *threads = calloc(nthreads, sizeof(pthread_t));
+    if (!threads) {
+        log_error("btkg_bruteforce_start_proxy: out of memory allocating %zu pthread_t entries", nthreads);
+        return;
+    }
+
+    size_t created = 0;
+    for (size_t i = 0; i < nthreads; ++i) {
+        log_debug("Creating thread (proxy): %zu", i);
+        int rc = pthread_create(&threads[i], NULL, btkg_bruteforce_worker_proxy, (void *)context);
+        if (rc != 0) {
+            log_error("btkg_bruteforce_start_proxy: pthread_create failed for thread %zu: %s", i, strerror(rc));
+            break; /* stop trying to create more threads */
+        }
+        created++;
+    }
+
+    /* join only the threads that were successfully created */
+    for (size_t i = 0; i < created; ++i) {
+        int rc = pthread_join(threads[i], NULL);
+        if (rc != 0) {
+            log_error("btkg_bruteforce_start_proxy: pthread_join failed for thread %zu: %s", i, strerror(rc));
+        }
+    }
+
+    free(threads);
 }
