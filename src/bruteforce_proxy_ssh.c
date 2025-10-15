@@ -260,7 +260,7 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 		btkg_credentials_t *combo = &credentials->credentials[context->credentials_idx];
 
 		/* CRITICAL FIX: Copy proxy data to local variables BEFORE unlocking */
-		char proxy_ip_copy[MAX_IP_LEN] = {0};
+		char proxy_ip_copy[MAX_IP_LEN];
 		uint16_t proxy_port_copy = 0;
 		int have_proxy = 0;
 
@@ -271,8 +271,10 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 			btkg_proxy_t *pxy = &proxies->proxies[context->proxies_idx];
 			
 			/* Copy proxy data to stack variables while we still hold the lock */
-			strncpy(proxy_ip_copy, pxy->ip, MAX_IP_LEN - 1);
-			proxy_ip_copy[MAX_IP_LEN - 1] = '\0';
+			size_t len = strlen(pxy->ip);
+			if (len >= MAX_IP_LEN) len = MAX_IP_LEN - 1;
+			memcpy(proxy_ip_copy, pxy->ip, len);
+			proxy_ip_copy[len] = '\0';
 			proxy_port_copy = pxy->port;
 			have_proxy = 1;
 		}
