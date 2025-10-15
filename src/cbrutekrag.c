@@ -470,7 +470,6 @@ int main(int argc, char **argv)
 	else{
 		btkg_bruteforce_start(&context);
 	}
-	btkg_bruteforce_start(&context);
 
 	btkg_progress_watcher_wait(&progress_watcher);
 
