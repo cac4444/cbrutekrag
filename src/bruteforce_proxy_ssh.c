@@ -1,7 +1,7 @@
 /*
- adapted bruteforce_proxy_ssh.c - proxy arg variant (FIXED)
- - Fixed race condition: proxy data is copied while holding lock
- - Fixed buffer overflow: IP/port copied to local variables before unlock
+ Fixed bruteforce_proxy_ssh.c
+ - Uses heap allocation for thread array
+ - Fixes race condition on proxy index access
 */
 
 #include <stdint.h>
@@ -17,8 +17,7 @@
 #include "log.h"
 #include "proxy.h"
 
-#define MAX_IP_LEN 16
-
+/* Attempt to brute-force SSH login using proxy */
 int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 			       uint16_t port, const char *username,
 			       const char *password,
@@ -125,21 +124,6 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 
 				char buffer[1024];
 				int nbytes;
-				size_t check_http_len = strlen(options->check_http);
-				
-				/* Prevent buffer overflow from long check_http string */
-				if (check_http_len > 900) {
-					log_error("check_http string too long (%zu bytes)", check_http_len);
-					if (channel) {
-						ssh_channel_close(channel);
-						ssh_channel_free(channel);
-					}
-					ssh_disconnect(session);
-					ssh_free(session);
-					if (proxied_fd >= 0) close(proxied_fd);
-					return -7;
-				}
-
 				snprintf(buffer, sizeof(buffer),
 					 "GET / HTTP/1.1\r\nHost: %s\r\n\r\n",
 					 options->check_http);
@@ -201,6 +185,7 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 	return -1;
 }
 
+/* Wrapper for trying login */
 int bruteforce_ssh_try_login_proxy(btkg_context_t *context, const char *hostname,
 				   const uint16_t port, const char *username,
 				   const char *password,
@@ -226,7 +211,7 @@ int bruteforce_ssh_try_login_proxy(btkg_context_t *context, const char *hostname
 	return ret;
 }
 
-/* FIXED Worker function - copies proxy data while holding lock */
+/* Worker function - FIXED: proxy index access now inside lock */
 static void *btkg_bruteforce_worker_proxy(void *ptr)
 {
 	btkg_context_t *context = (btkg_context_t *)ptr;
@@ -255,55 +240,31 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 			break;
 		}
 
-		/* Fetch work items while holding lock */
 		btkg_target_t *target = &targets->targets[context->targets_idx++];
 		btkg_credentials_t *combo = &credentials->credentials[context->credentials_idx];
 
-		/* CRITICAL FIX: Copy proxy data to local variables BEFORE unlocking */
-		char proxy_ip_copy[MAX_IP_LEN];
-		uint16_t proxy_port_copy = 0;
-		int have_proxy = 0;
-
+		/* FIXED: Read proxy info INSIDE the lock to avoid race conditions */
+		const char *proxy_ip = NULL;
+		uint16_t proxy_port = 0;
+		
 		if (proxies->count > 0) {
-			/* Bounds check before array access */
+			/* Ensure index is valid */
 			if (context->proxies_idx >= proxies->count) {
 				context->proxies_idx = 0;
 			}
-			
-			/* Additional safety: verify proxies array exists and index is valid */
-			if (!proxies->proxies || context->proxies_idx >= proxies->count) {
-				log_error("Invalid proxy array access: proxies=%p count=%zu idx=%zu",
-					(void*)proxies->proxies, proxies->count, context->proxies_idx);
-				pthread_mutex_unlock(&context->lock);
-				break;
-			}
-			
 			btkg_proxy_t *pxy = &proxies->proxies[context->proxies_idx];
-			
-			/* Verify proxy data is valid before copying */
-			if (pxy->ip[0] == '\0' || pxy->port == 0) {
-				log_error("Invalid proxy data at index %zu: ip='%s' port=%u",
-					context->proxies_idx, pxy->ip, pxy->port);
-				pthread_mutex_unlock(&context->lock);
-				break;
-			}
-			
-			/* Copy proxy data to stack variables while we still hold the lock */
-			size_t len = strnlen(pxy->ip, MAX_IP_LEN - 1);
-			memcpy(proxy_ip_copy, pxy->ip, len);
-			proxy_ip_copy[len] = '\0';
-			proxy_port_copy = pxy->port;
-			have_proxy = 1;
+			proxy_ip = pxy->ip;
+			proxy_port = pxy->port;
 		}
 
 		context->count++;
 		pthread_mutex_unlock(&context->lock);
-		/* NOW it's safe to use proxy_ip_copy and proxy_port_copy */
 
-		if (!have_proxy) {
+		/* Check if we have a valid proxy */
+		if (!proxy_ip || proxy_port == 0) {
 			if (!options->dry_run) {
 				log_debug("No proxy configured; skipping attempt for %s:%d", 
-					target->host, target->port);
+					  target->host, target->port);
 				continue;
 			}
 		}
@@ -312,63 +273,53 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 			int ret = bruteforce_ssh_try_login_proxy(context,
 					target->host, target->port,
 					combo->username, combo->password,
-					have_proxy ? proxy_ip_copy : NULL, 
-					proxy_port_copy);
+					proxy_ip, proxy_port);
 			if (ret == 0) {
 				pthread_mutex_lock(&context->lock);
 				context->successful++;
 				pthread_mutex_unlock(&context->lock);
 			}
 		} else {
-			const char *proxy_str = have_proxy ? proxy_ip_copy : "no-proxy";
+			const char *proxy_str = proxy_ip ? proxy_ip : "no-proxy";
 			log_debug("\033[38m[-]\033[0m %s:%d %s %s (proxy=%s:%u)",
 				  target->host, target->port, combo->username,
-				  combo->password, proxy_str, (unsigned)proxy_port_copy);
+				  combo->password, proxy_str, (unsigned)proxy_port);
 		}
 	}
 
 	return NULL;
 }
 
+/* FIXED: Use heap allocation for thread array to avoid stack overflow */
 void btkg_bruteforce_start_proxy(btkg_context_t *context)
 {
-    if (!context) {
-        log_error("btkg_bruteforce_start_proxy: NULL context");
-        return;
-    }
+	btkg_options_t *options = &context->options;
 
-    btkg_options_t *options = &context->options;
-    size_t nthreads = options->max_threads ? options->max_threads : 1;
+	/* Allocate thread array on HEAP instead of stack */
+	pthread_t *scan_threads = malloc(options->max_threads * sizeof(pthread_t));
+	if (!scan_threads) {
+		log_error("Failed to allocate memory for %zu threads", options->max_threads);
+		return;
+	}
 
-    const size_t SANE_MAX = 16384;
-    if (nthreads > SANE_MAX) {
-        log_error("Requested %zu threads exceeds sane cap %zu; capping.", nthreads, SANE_MAX);
-        nthreads = SANE_MAX;
-    }
+	int ret;
 
-    pthread_t *threads = calloc(nthreads, sizeof(pthread_t));
-    if (!threads) {
-        log_error("btkg_bruteforce_start_proxy: out of memory allocating %zu pthread_t entries", nthreads);
-        return;
-    }
+	for (size_t i = 0; i < options->max_threads; i++) {
+		log_debug("Creating thread (proxy): %ld", i);
+		if ((ret = pthread_create(&scan_threads[i], NULL,
+					  btkg_bruteforce_worker_proxy,
+					  (void *)context))) {
+			log_error("Thread creation failed: %d\n", ret);
+		}
+	}
 
-    size_t created = 0;
-    for (size_t i = 0; i < nthreads; ++i) {
-        log_debug("Creating thread (proxy): %zu", i);
-        int rc = pthread_create(&threads[i], NULL, btkg_bruteforce_worker_proxy, (void *)context);
-        if (rc != 0) {
-            log_error("btkg_bruteforce_start_proxy: pthread_create failed for thread %zu: %s", i, strerror(rc));
-            break;
-        }
-        created++;
-    }
+	for (size_t i = 0; i < options->max_threads; i++) {
+		ret = pthread_join(scan_threads[i], NULL);
+		if (ret != 0) {
+			log_error("Cannot join thread no: %d\n", ret);
+		}
+	}
 
-    for (size_t i = 0; i < created; ++i) {
-        int rc = pthread_join(threads[i], NULL);
-        if (rc != 0) {
-            log_error("btkg_bruteforce_start_proxy: pthread_join failed for thread %zu: %s", i, strerror(rc));
-        }
-    }
-
-    free(threads);
+	/* Free the heap-allocated array */
+	free(scan_threads);
 }
