@@ -1,8 +1,11 @@
 /*
- Fixed bruteforce_proxy_ssh.c
- - Uses heap allocation for thread array
- - Fixes race condition on proxy index access
-*/
+ * COMPLETE FIX for stack smashing with high thread counts
+ * 
+ * The problem: btkg_target_t contains char *host (pointer), so multiple threads
+ * access the same string pointer concurrently, causing corruption.
+ * 
+ * Solution: Copy ALL data to local stack variables inside the lock
+ */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -16,6 +19,8 @@
 #include "cbrutekrag.h"
 #include "log.h"
 #include "proxy.h"
+
+/* Prototypes */
 
 /* Attempt to brute-force SSH login using proxy */
 int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
@@ -211,25 +216,29 @@ int bruteforce_ssh_try_login_proxy(btkg_context_t *context, const char *hostname
 	return ret;
 }
 
+/* FIXED Worker function - all data copied to local variables */
 static void *btkg_bruteforce_worker_proxy(void *ptr)
 {
-	fprintf(stderr, "[WORKER] Thread started, ptr=%p\n", ptr);
-	fflush(stderr);
-	
 	btkg_context_t *context = (btkg_context_t *)ptr;
-	
-	fprintf(stderr, "[WORKER] Context cast successful\n");
-	fflush(stderr);
-	
 	btkg_target_list_t *targets = &context->targets;
 	btkg_credentials_list_t *credentials = &context->credentials;
 	btkg_proxy_list_t *proxies = &context->proxies;
 	btkg_options_t *options = &context->options;
 
-	fprintf(stderr, "[WORKER] All pointers assigned\n");
-	fflush(stderr);
-
 	for (;;) {
+		/* 
+		 * CRITICAL: All shared data must be copied to local variables
+		 * INSIDE the lock to prevent concurrent access issues
+		 */
+		char local_host[256] = {0};
+		uint16_t local_port = 0;
+		char local_username[256] = {0};
+		char local_password[256] = {0};
+		char local_proxy_ip[16] = {0};
+		uint16_t local_proxy_port = 0;
+		int has_proxy = 0;
+		int dry_run = 0;
+
 		pthread_mutex_lock(&context->lock);
 
 		if (context->targets_idx >= targets->length) {
@@ -246,128 +255,106 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 
 		if (context->credentials_idx >= credentials->length) {
 			pthread_mutex_unlock(&context->lock);
-			fprintf(stderr, "[WORKER] Thread exiting (no more work)\n");
-			fflush(stderr);
 			break;
 		}
 
+		/* Get pointers to shared data */
 		btkg_target_t *target = &targets->targets[context->targets_idx++];
 		btkg_credentials_t *combo = &credentials->credentials[context->credentials_idx];
 
-		const char *proxy_ip = NULL;
-		uint16_t proxy_port = 0;
-		
+		/* Copy target data - CRITICAL: target->host is a pointer! */
+		if (target->host != NULL) {
+			strncpy(local_host, target->host, sizeof(local_host) - 1);
+			local_host[sizeof(local_host) - 1] = '\0';
+		}
+		local_port = target->port;
+
+		/* Copy credentials - these are fixed-size arrays so safer */
+		strncpy(local_username, combo->username, sizeof(local_username) - 1);
+		local_username[sizeof(local_username) - 1] = '\0';
+		strncpy(local_password, combo->password, sizeof(local_password) - 1);
+		local_password[sizeof(local_password) - 1] = '\0';
+
+		/* Copy proxy data */
 		if (proxies->count > 0) {
 			if (context->proxies_idx >= proxies->count) {
 				context->proxies_idx = 0;
 			}
 			btkg_proxy_t *pxy = &proxies->proxies[context->proxies_idx];
-			proxy_ip = pxy->ip;
-			proxy_port = pxy->port;
+			strncpy(local_proxy_ip, pxy->ip, sizeof(local_proxy_ip) - 1);
+			local_proxy_ip[sizeof(local_proxy_ip) - 1] = '\0';
+			local_proxy_port = pxy->port;
+			has_proxy = 1;
 		}
+
+		/* Copy options we need */
+		dry_run = options->dry_run;
 
 		context->count++;
 		pthread_mutex_unlock(&context->lock);
 
-		if (!proxy_ip || proxy_port == 0) {
-			if (!options->dry_run) {
-				log_debug("No proxy configured; skipping attempt");
+		/* Now work with LOCAL copies only - no shared memory access */
+
+		if (!has_proxy || local_proxy_ip[0] == '\0' || local_proxy_port == 0) {
+			if (!dry_run) {
+				log_debug("No valid proxy; skipping attempt for %s:%d", 
+					  local_host, local_port);
 				continue;
 			}
 		}
 
-		if (!options->dry_run) {
+		if (!dry_run) {
 			int ret = bruteforce_ssh_try_login_proxy(context,
-					target->host, target->port,
-					combo->username, combo->password,
-					proxy_ip, proxy_port);
+					local_host, local_port,
+					local_username, local_password,
+					local_proxy_ip, local_proxy_port);
 			if (ret == 0) {
 				pthread_mutex_lock(&context->lock);
 				context->successful++;
 				pthread_mutex_unlock(&context->lock);
 			}
 		} else {
-			const char *proxy_str = proxy_ip ? proxy_ip : "no-proxy";
-			log_debug("[-] %s:%d %s %s (proxy=%s:%u)",
-				  target->host, target->port, combo->username,
-				  combo->password, proxy_str, (unsigned)proxy_port);
+			log_debug("\033[38m[-]\033[0m %s:%d %s %s (proxy=%s:%u)",
+				  local_host, local_port, local_username,
+				  local_password, local_proxy_ip, (unsigned)local_proxy_port);
 		}
 	}
 
-	fprintf(stderr, "[WORKER] Thread returning\n");
-	fflush(stderr);
 	return NULL;
 }
 
-/* FIXED: Use heap allocation for thread array to avoid stack overflow */
+/* Start brute-force with heap-allocated thread array */
 void btkg_bruteforce_start_proxy(btkg_context_t *context)
 {
 	btkg_options_t *options = &context->options;
-	
-	fprintf(stderr, "[DEBUG] Starting proxy bruteforce\n");
-	fprintf(stderr, "[DEBUG] max_threads = %zu\n", options->max_threads);
-	fprintf(stderr, "[DEBUG] proxies.count = %zu\n", context->proxies.count);
-	fprintf(stderr, "[DEBUG] targets.length = %zu\n", context->targets.length);
-	fprintf(stderr, "[DEBUG] credentials.length = %zu\n", context->credentials.length);
-	fflush(stderr);
 
-	/* Allocate thread array on HEAP */
-	fprintf(stderr, "[DEBUG] Allocating thread array for %zu threads (%zu bytes)\n", 
-		options->max_threads, options->max_threads * sizeof(pthread_t));
-	fflush(stderr);
-	
+	/* Allocate on heap to avoid stack overflow */
 	pthread_t *scan_threads = malloc(options->max_threads * sizeof(pthread_t));
 	if (!scan_threads) {
 		log_error("Failed to allocate memory for %zu threads", options->max_threads);
 		return;
 	}
-	fprintf(stderr, "[DEBUG] Thread array allocated successfully at %p\n", (void*)scan_threads);
-	fflush(stderr);
 
 	int ret;
 	size_t created = 0;
 
 	for (size_t i = 0; i < options->max_threads; i++) {
-		fprintf(stderr, "[DEBUG] Creating thread %zu/%zu...\n", i+1, options->max_threads);
-		fflush(stderr);
-		
+		log_debug("Creating thread (proxy): %ld", i);
 		if ((ret = pthread_create(&scan_threads[i], NULL,
 					  btkg_bruteforce_worker_proxy,
 					  (void *)context))) {
-			log_error("Thread creation failed at index %zu: %d\n", i, ret);
-			fprintf(stderr, "[DEBUG] Failed to create thread %zu, error=%d\n", i, ret);
-			fflush(stderr);
-			break;  // Stop creating more threads
+			log_error("Thread creation failed: %d\n", ret);
+			break;
 		}
 		created++;
-		
-		// Print progress every 100 threads
-		if ((i + 1) % 100 == 0) {
-			fprintf(stderr, "[DEBUG] Successfully created %zu threads so far\n", i+1);
-			fflush(stderr);
-		}
 	}
-
-	fprintf(stderr, "[DEBUG] Created %zu/%zu threads successfully\n", created, options->max_threads);
-	fprintf(stderr, "[DEBUG] Now joining threads...\n");
-	fflush(stderr);
 
 	for (size_t i = 0; i < created; i++) {
-		if ((i + 1) % 100 == 0) {
-			fprintf(stderr, "[DEBUG] Joined %zu threads so far\n", i+1);
-			fflush(stderr);
-		}
-		
 		ret = pthread_join(scan_threads[i], NULL);
 		if (ret != 0) {
-			log_error("Cannot join thread %zu: %d\n", i, ret);
+			log_error("Cannot join thread no: %d\n", ret);
 		}
 	}
 
-	fprintf(stderr, "[DEBUG] All threads joined, freeing thread array\n");
-	fflush(stderr);
-	
 	free(scan_threads);
-	fprintf(stderr, "[DEBUG] btkg_bruteforce_start_proxy completed\n");
-	fflush(stderr);
 }
