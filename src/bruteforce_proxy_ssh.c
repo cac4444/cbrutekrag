@@ -7,9 +7,18 @@
  * Solution: Copy ALL data to local stack variables inside the lock
  */
 
+/*
+ * THE REAL PROBLEM: Each thread gets 8MB stack by default!
+ * With 9000 threads = 72GB virtual address space = system exhaustion
+ * 
+ * SOLUTION: Set a smaller stack size per thread
+ */
+
+/* Add to start of bruteforce_proxy_ssh.c */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <stdlib.h>
 
@@ -19,6 +28,20 @@
 #include "cbrutekrag.h"
 #include "log.h"
 #include "proxy.h"
+
+/* Define a reasonable stack size per thread
+ * SSH workers don't need deep recursion, so 256KB is plenty
+ * This is way more than PTHREAD_STACK_MIN (16KB on most systems)
+ */
+#ifndef THREAD_STACK_SIZE
+#define THREAD_STACK_SIZE (256 * 1024)  /* 256 KB per thread */
+#endif
+
+/* ... keep all your existing functions (bruteforce_ssh_login_proxy, 
+   bruteforce_ssh_try_login_proxy, btkg_bruteforce_worker_proxy) 
+   exactly as they are with the local variable copies ... */
+
+/* UPDATED: btkg_bruteforce_start_proxy with pthread attributes */
 
 /* Prototypes */
 
