@@ -328,33 +328,73 @@ void btkg_bruteforce_start_proxy(btkg_context_t *context)
 {
 	btkg_options_t *options = &context->options;
 
-	/* Allocate on heap to avoid stack overflow */
-	pthread_t *scan_threads = malloc(options->max_threads * sizeof(pthread_t));
-	if (!scan_threads) {
-		log_error("Failed to allocate memory for %zu threads", options->max_threads);
+	/* Create pthread attributes to set stack size */
+	pthread_attr_t attr;
+	int ret = pthread_attr_init(&attr);
+	if (ret != 0) {
+		log_error("pthread_attr_init failed: %d", ret);
 		return;
 	}
 
-	int ret;
+	/* Set the stack size - THIS IS THE KEY FIX! */
+	ret = pthread_attr_setstacksize(&attr, THREAD_STACK_SIZE);
+	if (ret != 0) {
+		log_error("pthread_attr_setstacksize failed: %d (requested %zu bytes)", 
+			  ret, (size_t)THREAD_STACK_SIZE);
+		pthread_attr_destroy(&attr);
+		return;
+	}
+
+	/* Log the configuration */
+	size_t actual_stacksize;
+	pthread_attr_getstacksize(&attr, &actual_stacksize);
+	log_info("Using stack size of %zu KB per thread (%zu threads = %zu MB total virtual)",
+		 actual_stacksize / 1024,
+		 options->max_threads,
+		 (actual_stacksize * options->max_threads) / (1024 * 1024));
+
+	/* Allocate thread array on heap */
+	pthread_t *scan_threads = malloc(options->max_threads * sizeof(pthread_t));
+	if (!scan_threads) {
+		log_error("Failed to allocate memory for %zu threads", options->max_threads);
+		pthread_attr_destroy(&attr);
+		return;
+	}
+
 	size_t created = 0;
 
+	/* Create threads with reduced stack size */
 	for (size_t i = 0; i < options->max_threads; i++) {
 		log_debug("Creating thread (proxy): %ld", i);
-		if ((ret = pthread_create(&scan_threads[i], NULL,
-					  btkg_bruteforce_worker_proxy,
-					  (void *)context))) {
-			log_error("Thread creation failed: %d\n", ret);
+		
+		/* Pass &attr to use our custom stack size */
+		ret = pthread_create(&scan_threads[i], &attr, 
+				     btkg_bruteforce_worker_proxy,
+				     (void *)context);
+		
+		if (ret != 0) {
+			log_error("Thread %zu creation failed: %d", i, ret);
+			if (ret == EAGAIN) {
+				log_error("System lacks resources (EAGAIN). Created %zu threads.", i);
+			} else if (ret == EINVAL) {
+				log_error("Invalid thread attributes (EINVAL)");
+			} else if (ret == EPERM) {
+				log_error("No permission (EPERM)");
+			}
 			break;
 		}
 		created++;
 	}
 
+	log_info("Successfully created %zu threads", created);
+
+	/* We're done with attributes, destroy them */
+	pthread_attr_destroy(&attr);
+
+	/* Join all created threads */
 	for (size_t i = 0; i < created; i++) {
 		ret = pthread_join(scan_threads[i], NULL);
 		if (ret != 0) {
-			log_error("Cannot join thread no: %d\n", ret);
+			log_error("Cannot join thread %zu: %d", i, ret);
 		}
 	}
-
-	free(scan_threads);
-}
