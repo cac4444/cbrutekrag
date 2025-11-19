@@ -421,3 +421,10 @@ void btkg_bruteforce_start_proxy(btkg_context_t *context)
 			log_error("Cannot join thread %zu: %d", i, ret);
 		}
 	}
+	fprintf(stderr, "[DEBUG] All threads joined, freeing thread array\n");
+	fflush(stderr);
+	
+	free(scan_threads);
+	fprintf(stderr, "[DEBUG] btkg_bruteforce_start_proxy completed\n");
+	fflush(stderr);
+}
