@@ -11,10 +11,10 @@
 #include "log.h"
 
 #ifndef BTKG_PROXY_LIST_INITIAL_CAP
-#define BTKG_PROXY_LIST_INITIAL_CAP 16
+#define BTKG_PROXY_LIST_INITIAL_CAP 128
 #endif
 
-#define IPV4_STR_MAX 16
+#define IPV4_STR_MAX 128
 
 void btkg_proxy_list_init(btkg_proxy_list_t *list) {
     if (!list) return;
