@@ -308,12 +308,15 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
 		if (!options->dry_run) {
 
 			int ret = bruteforce_ssh_try_login_proxy(
-				context,
-				target->host, target->port,
-			 
+			    context,
+			    target->host,
+			    target->port,
+			    combo->username,
+			    combo->password,
+			    proxy_ip,
+			    proxy_port
+			);
 
-(combo->username, combo->password,
-				proxy_ip, proxy_port);
 
 			if (ret == 0) {
 				pthread_mutex_lock(&context->lock);
