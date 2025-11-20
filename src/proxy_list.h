@@ -10,7 +10,7 @@ extern "C" {
 
 /* single proxy: IPv4 address string and numeric port */
 typedef struct {
-    char ip[16];     /* e.g. "192.168.0.1" + NUL */
+    char ip[128];     /* e.g. "192.168.0.1" + NUL */
     uint16_t port;   /* host byte order */
 } btkg_proxy_t;
 
