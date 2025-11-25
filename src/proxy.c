@@ -12,9 +12,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <stdint.h>
-
-/* FIXED: Replaced sys/select.h with poll.h */
-#include <poll.h>
+#include <poll.h>       /* Required for thread-safe timeouts */
 
 #include "cbrutekrag.h"
 #include "log.h"
@@ -23,7 +21,8 @@
 #define BTKG_PROXY_DEFAULT_TIMEOUT 5
 #endif
 
-/* helper: set socket non-blocking */
+/* --- Helper Functions (Same as before) --- */
+
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1) return -1;
@@ -31,74 +30,49 @@ static int set_nonblocking(int fd) {
     return flags;
 }
 
-/* helper: restore flags */
 static int restore_flags(int fd, int flags) {
     if (fcntl(fd, F_SETFL, flags) == -1) return -1;
     return 0;
 }
 
-/* 
- * FIXED: connect_with_timeout using poll() instead of select().
- * select() crashes (buffer overflow) if sockfd >= 1024.
- */
+/* Uses poll() to avoid buffer overflow crashes with high thread counts */
 static int connect_with_timeout(int sockfd, const struct sockaddr *addr, socklen_t addrlen, int timeout_sec) {
     int orig_flags = set_nonblocking(sockfd);
-    if (orig_flags == -1) {
-        return -1;
-    }
+    if (orig_flags == -1) return -1;
 
     int rc = connect(sockfd, addr, addrlen);
     if (rc == 0) {
-        /* immediately connected */
         restore_flags(sockfd, orig_flags);
         return 0;
     }
 
     if (errno != EINPROGRESS) {
-        /* immediate error */
         restore_flags(sockfd, orig_flags);
         return -1;
     }
 
-    /* FIXED: Use poll() structure */
     struct pollfd pfd;
     pfd.fd = sockfd;
-    pfd.events = POLLOUT; /* We wait for writing (connection established) */
+    pfd.events = POLLOUT;
 
-    /* poll timeout is in milliseconds */
     rc = poll(&pfd, 1, timeout_sec * 1000);
 
-    if (rc == -1) {
-        /* poll error */
+    if (rc <= 0) {
         restore_flags(sockfd, orig_flags);
         return -1;
     }
 
-    if (rc == 0) {
-        /* timeout */
-        restore_flags(sockfd, orig_flags);
-        return -1;
-    }
-
-    /* Check for socket error using getsockopt */
     int so_err = 0;
     socklen_t len = sizeof(so_err);
-    if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_err, &len) < 0) {
-        restore_flags(sockfd, orig_flags);
-        return -1;
-    }
-    if (so_err != 0) {
-        /* Connection failed asynchronously */
+    if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_err, &len) < 0 || so_err != 0) {
         restore_flags(sockfd, orig_flags);
         return -1;
     }
 
-    /* connected */
     restore_flags(sockfd, orig_flags);
     return 0;
 }
 
-/* helper: fully write buffer */
 static ssize_t write_all(int fd, const void *buf, size_t len) {
     const unsigned char *p = buf;
     size_t left = len;
@@ -114,7 +88,6 @@ static ssize_t write_all(int fd, const void *buf, size_t len) {
     return (ssize_t)len;
 }
 
-/* helper: read exactly n bytes */
 static int recv_all(int fd, void *buf, size_t n) {
     unsigned char *p = buf;
     size_t left = n;
@@ -124,16 +97,18 @@ static int recv_all(int fd, void *buf, size_t n) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (r == 0) return -1; /* peer closed */
+        if (r == 0) return -1;
         p += r;
         left -= (size_t)r;
     }
     return 0;
 }
 
-/* FIXED: Supports Hostnames (DNS) and IPs using getaddrinfo */
+/* --- Main Proxy Logic --- */
+
 int btkg_proxy_socks5_connect(btkg_context_t *context,
                               const char *proxy_ip, uint16_t proxy_port,
+                              const char *proxy_user, const char *proxy_pass,
                               const char *dest_host, uint16_t dest_port,
                               int *out_fd)
 {
@@ -154,14 +129,13 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
     struct addrinfo hints, *res, *rp;
     char port_str[6];
 
-    /* Convert port to string for getaddrinfo */
     snprintf(port_str, sizeof(port_str), "%u", proxy_port);
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;      /* Force IPv4 for now (easier for SOCKS5) */
+    hints.ai_family = AF_INET; /* Force IPv4 */
     hints.ai_socktype = SOCK_STREAM;
 
-    /* 1. Resolve Proxy Hostname (Thread-Safe) */
+    /* Resolve Proxy Address (Thread-safe) */
     int gai_err = getaddrinfo(proxy_ip, port_str, &hints, &res);
     if (gai_err != 0) {
         log_error("proxy_socks5_connect: could not resolve proxy '%s': %s", 
@@ -169,49 +143,118 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
         return -1;
     }
 
-    /* 2. Try to connect to one of the resolved addresses */
+    /* Try to connect */
     for (rp = res; rp != NULL; rp = rp->ai_next) {
         sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (sock == -1) continue;
 
         if (connect_with_timeout(sock, rp->ai_addr, rp->ai_addrlen, timeout) == 0) {
-            break; /* Success */
+            break; 
         }
 
-        close(sock); /* Failed, try next */
+        close(sock);
         sock = -1;
     }
-
-    freeaddrinfo(res); /* Free memory allocated by getaddrinfo */
+    freeaddrinfo(res);
 
     if (sock == -1) {
-        log_debug("proxy_socks5_connect: failed to connect to proxy %s:%u", 
-                  proxy_ip, (unsigned)proxy_port);
         return -1;
     }
 
-    /* --- SOCKS5 handshake (no auth) --- */
-    unsigned char greeting[3];
-    greeting[0] = 0x05; 
-    greeting[1] = 0x01; 
-    greeting[2] = 0x00; 
+    /* --- SOCKS5 Handshake: Greeting --- */
+    unsigned char greeting[4];
+    size_t greeting_len;
 
-    if (write_all(sock, greeting, sizeof(greeting)) != (ssize_t)sizeof(greeting)) {
+    /* Check if we have credentials to send */
+    int has_auth = (proxy_user != NULL && proxy_pass != NULL && 
+                   strlen(proxy_user) > 0 && strlen(proxy_pass) > 0);
+
+    if (has_auth) {
+        /* Offer Method 0x00 (No Auth) AND 0x02 (Username/Password) */
+        greeting[0] = 0x05; // Version
+        greeting[1] = 0x02; // Number of methods
+        greeting[2] = 0x00; // Method: No Auth
+        greeting[3] = 0x02; // Method: User/Pass
+        greeting_len = 4;
+    } else {
+        /* Offer only Method 0x00 (No Auth) */
+        greeting[0] = 0x05;
+        greeting[1] = 0x01;
+        greeting[2] = 0x00;
+        greeting_len = 3;
+    }
+
+    if (write_all(sock, greeting, greeting_len) != (ssize_t)greeting_len) {
         close(sock);
         return -1;
     }
 
+    /* Read Server Choice */
     unsigned char method_sel[2];
     if (recv_all(sock, method_sel, sizeof(method_sel)) != 0) {
         close(sock);
         return -1;
     }
-    if (method_sel[0] != 0x05 || method_sel[1] != 0x00) {
+    if (method_sel[0] != 0x05) {
         close(sock);
         return -1;
     }
 
-    /* --- SOCKS5 CONNECT request --- */
+    unsigned char chosen_method = method_sel[1];
+
+    /* --- SOCKS5 Handshake: Authentication (if requested) --- */
+    if (chosen_method == 0x02) {
+        if (!has_auth) {
+            /* Server wants auth, but we didn't provide any? Should be impossible based on greeting. */
+            close(sock);
+            return -1;
+        }
+
+        size_t ulen = strlen(proxy_user);
+        size_t plen = strlen(proxy_pass);
+        
+        if (ulen > 255 || plen > 255) {
+            log_error("proxy_socks5_connect: credentials too long");
+            close(sock);
+            return -1;
+        }
+
+        /* Build Auth Request: [0x01][ULEN][USER][PLEN][PASS] */
+        unsigned char auth_req[515]; // Max size
+        size_t idx = 0;
+        auth_req[idx++] = 0x01;       // Sub-negotiation Version
+        auth_req[idx++] = (unsigned char)ulen;
+        memcpy(&auth_req[idx], proxy_user, ulen);
+        idx += ulen;
+        auth_req[idx++] = (unsigned char)plen;
+        memcpy(&auth_req[idx], proxy_pass, plen);
+        idx += plen;
+
+        if (write_all(sock, auth_req, idx) != (ssize_t)idx) {
+            close(sock);
+            return -1;
+        }
+
+        /* Read Auth Response: [0x01][STATUS] */
+        unsigned char auth_resp[2];
+        if (recv_all(sock, auth_resp, sizeof(auth_resp)) != 0) {
+            close(sock);
+            return -1;
+        }
+
+        if (auth_resp[1] != 0x00) {
+            log_debug("proxy_socks5_connect: authentication failed for %s", proxy_user);
+            close(sock);
+            return -1;
+        }
+
+    } else if (chosen_method != 0x00) {
+        /* Server rejected our methods (0xFF) or wants unsupported method */
+        close(sock);
+        return -1;
+    }
+
+    /* --- SOCKS5 CONNECT Request --- */
     unsigned char req[512];
     size_t req_len = 0;
 
@@ -219,24 +262,20 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
     req[1] = 0x01; /* CONNECT */
     req[2] = 0x00; 
 
-    /* Resolve destination to see if it is IP or Hostname */
     struct in_addr dest_addr;
     if (inet_pton(AF_INET, dest_host, &dest_addr) == 1) {
-        /* IPv4: Pass raw bytes to proxy */
-        req[3] = 0x01; 
+        req[3] = 0x01; /* IPv4 */
         memcpy(req + 4, &dest_addr.s_addr, 4); 
         uint16_t netport = htons(dest_port);
         memcpy(req + 8, &netport, 2);
         req_len = 10;
     } else {
-        /* Hostname: Let the PROXY server resolve it (Remote DNS) */
         size_t hn = strlen(dest_host);
         if (hn > 255) {
-            log_error("proxy_socks5_connect: dest hostname too long");
             close(sock);
             return -1;
         }
-        req[3] = 0x03; 
+        req[3] = 0x03; /* Domain */
         req[4] = (unsigned char)hn;
         memcpy(req + 5, dest_host, hn);
         uint16_t netport = htons(dest_port);
@@ -249,7 +288,7 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
         return -1;
     }
 
-    /* read reply header */
+    /* Read Reply Header */
     unsigned char reply_hdr[4];
     if (recv_all(sock, reply_hdr, sizeof(reply_hdr)) != 0) {
         close(sock);
@@ -261,22 +300,19 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
         return -1;
     }
 
-    /* Consume the rest of the response */
+    /* Consume Remainder */
     if (reply_hdr[3] == 0x01) {
-        unsigned char addrbuf[6];
-        recv_all(sock, addrbuf, sizeof(addrbuf));
+        unsigned char buf[6];
+        recv_all(sock, buf, 6);
     } else if (reply_hdr[3] == 0x03) {
         unsigned char lenb;
         if (recv_all(sock, &lenb, 1) == 0) {
-            size_t name_len = (size_t)lenb;
-            unsigned char tmpbuf[256];
-            recv_all(sock, tmpbuf, name_len);
-            unsigned char portbuf[2];
-            recv_all(sock, portbuf, 2);
+            unsigned char buf[256 + 2];
+            recv_all(sock, buf, lenb + 2);
         }
     } else if (reply_hdr[3] == 0x04) {
-        unsigned char tmp[18];
-        recv_all(sock, tmp, sizeof(tmp));
+        unsigned char buf[18];
+        recv_all(sock, buf, 18);
     }
 
     *out_fd = sock;
