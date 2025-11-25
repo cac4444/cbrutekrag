@@ -131,6 +131,7 @@ static int recv_all(int fd, void *buf, size_t n) {
     return 0;
 }
 
+/* FIXED: Supports Hostnames (DNS) and IPs using getaddrinfo */
 int btkg_proxy_socks5_connect(btkg_context_t *context,
                               const char *proxy_ip, uint16_t proxy_port,
                               const char *dest_host, uint16_t dest_port,
@@ -150,30 +151,42 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
     }
 
     int sock = -1;
-    struct sockaddr_in sa;
+    struct addrinfo hints, *res, *rp;
+    char port_str[6];
 
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(proxy_port);
-    
-    /* Note: inet_pton requires a numeric IP. If proxy_ip is a hostname, 
-       you would need getaddrinfo, but sticking to numeric proxy IPs is safer 
-       for threading unless you implement getaddrinfo carefully. */
-    if (inet_pton(AF_INET, proxy_ip, &sa.sin_addr) != 1) {
-        log_error("proxy_socks5_connect: invalid proxy IP '%s' (must be numeric IPv4)", proxy_ip);
+    /* Convert port to string for getaddrinfo */
+    snprintf(port_str, sizeof(port_str), "%u", proxy_port);
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;      /* Force IPv4 for now (easier for SOCKS5) */
+    hints.ai_socktype = SOCK_STREAM;
+
+    /* 1. Resolve Proxy Hostname (Thread-Safe) */
+    int gai_err = getaddrinfo(proxy_ip, port_str, &hints, &res);
+    if (gai_err != 0) {
+        log_error("proxy_socks5_connect: could not resolve proxy '%s': %s", 
+                  proxy_ip, gai_strerror(gai_err));
         return -1;
     }
 
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        log_error("proxy_socks5_connect: socket() failed: %s", strerror(errno));
-        return -1;
+    /* 2. Try to connect to one of the resolved addresses */
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sock == -1) continue;
+
+        if (connect_with_timeout(sock, rp->ai_addr, rp->ai_addrlen, timeout) == 0) {
+            break; /* Success */
+        }
+
+        close(sock); /* Failed, try next */
+        sock = -1;
     }
 
-    if (connect_with_timeout(sock, (struct sockaddr *)&sa, sizeof(sa), timeout) != 0) {
-        /* log_debug commented out to reduce noise on failure */
-        // log_debug("proxy_socks5_connect: connect to proxy %s:%u failed", proxy_ip, (unsigned)proxy_port);
-        close(sock);
+    freeaddrinfo(res); /* Free memory allocated by getaddrinfo */
+
+    if (sock == -1) {
+        log_debug("proxy_socks5_connect: failed to connect to proxy %s:%u", 
+                  proxy_ip, (unsigned)proxy_port);
         return -1;
     }
 
@@ -206,16 +219,17 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
     req[1] = 0x01; /* CONNECT */
     req[2] = 0x00; 
 
+    /* Resolve destination to see if it is IP or Hostname */
     struct in_addr dest_addr;
     if (inet_pton(AF_INET, dest_host, &dest_addr) == 1) {
-        /* IPv4 */
+        /* IPv4: Pass raw bytes to proxy */
         req[3] = 0x01; 
         memcpy(req + 4, &dest_addr.s_addr, 4); 
         uint16_t netport = htons(dest_port);
         memcpy(req + 8, &netport, 2);
         req_len = 10;
     } else {
-        /* Domain name */
+        /* Hostname: Let the PROXY server resolve it (Remote DNS) */
         size_t hn = strlen(dest_host);
         if (hn > 255) {
             log_error("proxy_socks5_connect: dest hostname too long");
@@ -243,49 +257,28 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
     }
 
     if (reply_hdr[0] != 0x05 || reply_hdr[1] != 0x00) {
-        /* Proxy reported error */
         close(sock);
         return -1;
     }
 
-    /* Consume the rest of the response based on ATYP */
+    /* Consume the rest of the response */
     if (reply_hdr[3] == 0x01) {
-        unsigned char addrbuf[6]; // IPv4 (4) + Port (2)
-        if (recv_all(sock, addrbuf, sizeof(addrbuf)) != 0) {
-            close(sock);
-            return -1;
-        }
+        unsigned char addrbuf[6];
+        recv_all(sock, addrbuf, sizeof(addrbuf));
     } else if (reply_hdr[3] == 0x03) {
         unsigned char lenb;
-        if (recv_all(sock, &lenb, 1) != 0) {
-            close(sock);
-            return -1;
-        }
-        size_t name_len = (size_t)lenb;
-        if (name_len > 0) {
+        if (recv_all(sock, &lenb, 1) == 0) {
+            size_t name_len = (size_t)lenb;
             unsigned char tmpbuf[256];
-            if (recv_all(sock, tmpbuf, name_len) != 0) {
-                close(sock);
-                return -1;
-            }
-        }
-        unsigned char portbuf[2];
-        if (recv_all(sock, portbuf, 2) != 0) {
-            close(sock);
-            return -1;
+            recv_all(sock, tmpbuf, name_len);
+            unsigned char portbuf[2];
+            recv_all(sock, portbuf, 2);
         }
     } else if (reply_hdr[3] == 0x04) {
-        unsigned char tmp[18]; // IPv6 (16) + Port (2)
-        if (recv_all(sock, tmp, sizeof(tmp)) != 0) {
-            close(sock);
-            return -1;
-        }
-    } else {
-        close(sock);
-        return -1;
+        unsigned char tmp[18];
+        recv_all(sock, tmp, sizeof(tmp));
     }
 
-    /* Success: return the open socket */
     *out_fd = sock;
     return 0;
 }
