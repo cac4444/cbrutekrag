@@ -9,10 +9,10 @@ extern "C" {
 #endif
 
 /*
- * Single proxy entry with IPv4 + port + optional username/password
+ * Single proxy entry with Hostname/IP + port + optional username/password
  */
 typedef struct {
-    char ip[64];       /* IPv4 string */
+    char ip[256];      /* IPv4 or Hostname (increased size for DNS names) */
     uint16_t port;     /* numeric port */
     char user[64];     /* proxy username (optional) */
     char pass[64];     /* proxy password (optional) */
@@ -45,8 +45,7 @@ int btkg_proxy_list_append(btkg_proxy_list_t *list,
  * Format:
  *   ip:port
  *   ip:port:user:pass
- *   ip:port::
- *   ip:port:user:
+ *   domain:port:user:pass
  */
 int btkg_proxy_list_load_from_file(const char *filename,
                                    btkg_proxy_list_t *list);
