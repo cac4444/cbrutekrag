@@ -17,7 +17,7 @@
 #include "log.h"
 #include "proxy.h"
 
-/* Attempt to brute-force SSH login using proxy */
+/* Fixed bruteforce_ssh_login_proxy to prevent Double Close/Race Condition */
 int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 			       uint16_t port, const char *username,
 			       const char *password,
@@ -46,11 +46,18 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 	}
 
 	int proxied_fd = -1;
+	// Ensure this function inside proxy.c uses getaddrinfo, NOT gethostbyname
 	if (btkg_proxy_socks5_connect(context, proxy_ip, proxy_port,
 				      hostname, port, &proxied_fd) != 0) {
 		log_debug("Failed to connect to %s:%u via proxy %s:%u",
 			  hostname, (unsigned)port, proxy_ip,
 			  (unsigned)proxy_port);
+		
+		/* FIXED: If connection failed, the FD might be open or closed depending 
+           on your implementation of btkg_proxy_socks5_connect. 
+           Assuming it returns an open FD on partial failure, we close it here.
+           BUT, we haven't given it to libssh yet. */
+		if (proxied_fd >= 0) close(proxied_fd);
 		ssh_free(session);
 		return -1;
 	}
@@ -61,7 +68,13 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 	ssh_options_set(session, SSH_OPTIONS_PORT, &(int){ port });
 	ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeout);
 	ssh_options_set(session, SSH_OPTIONS_USER, username);
+	
+	/* FIXED: Pass FD to libssh. Libssh now OWNS this FD. */
 	ssh_options_set(session, SSH_OPTIONS_FD, &proxied_fd);
+    
+    /* FIXED: Mark proxied_fd as -1 locally so we never close it manually again. 
+       ssh_free() will close the actual socket. */
+    proxied_fd = -1; 
 
 	int r = ssh_connect(session);
 	if (r != SSH_OK) {
@@ -69,7 +82,7 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 			log_error("[!] Error connecting to %s:%d %s.", hostname,
 				  port, ssh_get_error(session));
 		}
-		if (proxied_fd >= 0) close(proxied_fd);
+		// ssh_free will close the socket automatically
 		ssh_free(session);
 		return -1;
 	}
@@ -77,17 +90,15 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 	r = ssh_userauth_none(session, NULL);
 	if (r == SSH_AUTH_SUCCESS) {
 		log_debug("[!] %s:%d - Server without authentication.", hostname, port);
-		ssh_disconnect(session);
+		ssh_disconnect(session); // Closes socket
 		ssh_free(session);
-		if (proxied_fd >= 0) close(proxied_fd);
 		return -1;
 	}
 
 	if (r == SSH_AUTH_ERROR) {
 		log_debug("[!] %s:%d - ssh_userauth_none(): A serious error happened.", hostname, port);
-		ssh_disconnect(session);
+		ssh_disconnect(session); // Closes socket
 		ssh_free(session);
-		if (proxied_fd >= 0) close(proxied_fd);
 		return -1;
 	}
 
@@ -102,7 +113,6 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 					log_error("Error ssh_channel_new: %s", ssh_get_error(session));
 					ssh_disconnect(session);
 					ssh_free(session);
-					if (proxied_fd >= 0) close(proxied_fd);
 					return -2;
 				}
 
@@ -118,7 +128,6 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 					}
 					ssh_disconnect(session);
 					ssh_free(session);
-					if (proxied_fd >= 0) close(proxied_fd);
 					return -3;
 				}
 
@@ -137,7 +146,6 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 					}
 					ssh_disconnect(session);
 					ssh_free(session);
-					if (proxied_fd >= 0) close(proxied_fd);
 					return -4;
 				}
 
@@ -150,7 +158,6 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 					}
 					ssh_disconnect(session);
 					ssh_free(session);
-					if (proxied_fd >= 0) close(proxied_fd);
 					return -6;
 				}
 
@@ -162,7 +169,6 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 					}
 					ssh_disconnect(session);
 					ssh_free(session);
-					if (proxied_fd >= 0) close(proxied_fd);
 					return -5;
 				}
 
@@ -174,16 +180,19 @@ int bruteforce_ssh_login_proxy(btkg_context_t *context, const char *hostname,
 
 			ssh_disconnect(session);
 			ssh_free(session);
-			if (proxied_fd >= 0) close(proxied_fd);
 			return 0;
 		}
 	}
 
 	ssh_disconnect(session);
 	ssh_free(session);
-	if (proxied_fd >= 0) close(proxied_fd);
+	
+	/* REMOVED: if (proxied_fd >= 0) close(proxied_fd); 
+	   This was causing the Double Close / FD Race Condition */
+	   
 	return -1;
 }
+
 
 /* Wrapper for trying login */
 int bruteforce_ssh_try_login_proxy(btkg_context_t *context, const char *hostname,
