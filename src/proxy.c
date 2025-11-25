@@ -11,18 +11,19 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
-#include <sys/select.h>
 #include <stdint.h>
 
-#include "cbrutekrag.h" /* for btkg_context_t definition in your project */
-#include "log.h"        /* project logging helpers */
+/* FIXED: Replaced sys/select.h with poll.h */
+#include <poll.h>
 
-/* default timeout in seconds if context==NULL or option not set */
+#include "cbrutekrag.h"
+#include "log.h"
+
 #ifndef BTKG_PROXY_DEFAULT_TIMEOUT
 #define BTKG_PROXY_DEFAULT_TIMEOUT 5
 #endif
 
-/* helper: set socket non-blocking, return previous flags on success, -1 on error */
+/* helper: set socket non-blocking */
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1) return -1;
@@ -36,8 +37,9 @@ static int restore_flags(int fd, int flags) {
     return 0;
 }
 
-/* helper: perform non-blocking connect with timeout (seconds).
- * returns 0 on success (connected), -1 on failure (socket closed by caller)
+/* 
+ * FIXED: connect_with_timeout using poll() instead of select().
+ * select() crashes (buffer overflow) if sockfd >= 1024.
  */
 static int connect_with_timeout(int sockfd, const struct sockaddr *addr, socklen_t addrlen, int timeout_sec) {
     int orig_flags = set_nonblocking(sockfd);
@@ -58,21 +60,27 @@ static int connect_with_timeout(int sockfd, const struct sockaddr *addr, socklen
         return -1;
     }
 
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(sockfd, &wfds);
-    struct timeval tv;
-    tv.tv_sec = timeout_sec;
-    tv.tv_usec = 0;
+    /* FIXED: Use poll() structure */
+    struct pollfd pfd;
+    pfd.fd = sockfd;
+    pfd.events = POLLOUT; /* We wait for writing (connection established) */
 
-    rc = select(sockfd + 1, NULL, &wfds, NULL, &tv);
-    if (rc <= 0) {
-        /* timeout or select error */
+    /* poll timeout is in milliseconds */
+    rc = poll(&pfd, 1, timeout_sec * 1000);
+
+    if (rc == -1) {
+        /* poll error */
         restore_flags(sockfd, orig_flags);
         return -1;
     }
 
-    /* check for socket error */
+    if (rc == 0) {
+        /* timeout */
+        restore_flags(sockfd, orig_flags);
+        return -1;
+    }
+
+    /* Check for socket error using getsockopt */
     int so_err = 0;
     socklen_t len = sizeof(so_err);
     if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_err, &len) < 0) {
@@ -80,6 +88,7 @@ static int connect_with_timeout(int sockfd, const struct sockaddr *addr, socklen
         return -1;
     }
     if (so_err != 0) {
+        /* Connection failed asynchronously */
         restore_flags(sockfd, orig_flags);
         return -1;
     }
@@ -89,7 +98,7 @@ static int connect_with_timeout(int sockfd, const struct sockaddr *addr, socklen
     return 0;
 }
 
-/* helper: fully write buffer (handles partial writes) */
+/* helper: fully write buffer */
 static ssize_t write_all(int fd, const void *buf, size_t len) {
     const unsigned char *p = buf;
     size_t left = len;
@@ -105,7 +114,7 @@ static ssize_t write_all(int fd, const void *buf, size_t len) {
     return (ssize_t)len;
 }
 
-/* helper: read exactly n bytes (or fail). returns 0 on success, -1 on error */
+/* helper: read exactly n bytes */
 static int recv_all(int fd, void *buf, size_t n) {
     unsigned char *p = buf;
     size_t left = n;
@@ -134,7 +143,6 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
 
     int timeout = BTKG_PROXY_DEFAULT_TIMEOUT;
     if (context != NULL) {
-        /* prefer proxy_timeout if set, else fall back to general timeout */
         if (context->options.proxy_timeout)
             timeout = context->options.proxy_timeout;
         else if (context->options.timeout)
@@ -147,8 +155,12 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_port = htons(proxy_port);
+    
+    /* Note: inet_pton requires a numeric IP. If proxy_ip is a hostname, 
+       you would need getaddrinfo, but sticking to numeric proxy IPs is safer 
+       for threading unless you implement getaddrinfo carefully. */
     if (inet_pton(AF_INET, proxy_ip, &sa.sin_addr) != 1) {
-        log_error("proxy_socks5_connect: invalid proxy IP '%s'", proxy_ip);
+        log_error("proxy_socks5_connect: invalid proxy IP '%s' (must be numeric IPv4)", proxy_ip);
         return -1;
     }
 
@@ -158,52 +170,47 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
         return -1;
     }
 
-    /* connect with timeout */
     if (connect_with_timeout(sock, (struct sockaddr *)&sa, sizeof(sa), timeout) != 0) {
-        log_error("proxy_socks5_connect: connect to proxy %s:%u failed", proxy_ip, (unsigned)proxy_port);
+        /* log_debug commented out to reduce noise on failure */
+        // log_debug("proxy_socks5_connect: connect to proxy %s:%u failed", proxy_ip, (unsigned)proxy_port);
         close(sock);
         return -1;
     }
 
     /* --- SOCKS5 handshake (no auth) --- */
     unsigned char greeting[3];
-    greeting[0] = 0x05; /* VER */
-    greeting[1] = 0x01; /* NMETHODS */
-    greeting[2] = 0x00; /* METHOD = NO AUTH */
+    greeting[0] = 0x05; 
+    greeting[1] = 0x01; 
+    greeting[2] = 0x00; 
 
     if (write_all(sock, greeting, sizeof(greeting)) != (ssize_t)sizeof(greeting)) {
-        log_error("proxy_socks5_connect: failed to send greeting");
         close(sock);
         return -1;
     }
 
     unsigned char method_sel[2];
     if (recv_all(sock, method_sel, sizeof(method_sel)) != 0) {
-        log_error("proxy_socks5_connect: failed to read method selection");
         close(sock);
         return -1;
     }
     if (method_sel[0] != 0x05 || method_sel[1] != 0x00) {
-        log_error("proxy_socks5_connect: proxy does not accept NO AUTH (VER=%u, METHOD=%u)", method_sel[0], method_sel[1]);
         close(sock);
         return -1;
     }
 
     /* --- SOCKS5 CONNECT request --- */
-    /* Build request buffer dynamically depending on dest_host form */
     unsigned char req[512];
     size_t req_len = 0;
 
-    req[0] = 0x05; /* VER */
-    req[1] = 0x01; /* CMD = CONNECT */
-    req[2] = 0x00; /* RSV */
+    req[0] = 0x05; 
+    req[1] = 0x01; /* CONNECT */
+    req[2] = 0x00; 
 
-    /* check if dest_host is IPv4 numeric */
     struct in_addr dest_addr;
     if (inet_pton(AF_INET, dest_host, &dest_addr) == 1) {
         /* IPv4 */
-        req[3] = 0x01; /* ATYP = IPv4 */
-        memcpy(req + 4, &dest_addr.s_addr, 4); /* network byte order already */
+        req[3] = 0x01; 
+        memcpy(req + 4, &dest_addr.s_addr, 4); 
         uint16_t netport = htons(dest_port);
         memcpy(req + 8, &netport, 2);
         req_len = 10;
@@ -215,7 +222,7 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
             close(sock);
             return -1;
         }
-        req[3] = 0x03; /* ATYP = DOMAIN NAME */
+        req[3] = 0x03; 
         req[4] = (unsigned char)hn;
         memcpy(req + 5, dest_host, hn);
         uint16_t netport = htons(dest_port);
@@ -224,46 +231,33 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
     }
 
     if (write_all(sock, req, req_len) != (ssize_t)req_len) {
-        log_error("proxy_socks5_connect: failed to send connect request");
         close(sock);
         return -1;
     }
 
-    /* read reply: first 4 bytes (VER, REP, RSV, ATYP) */
+    /* read reply header */
     unsigned char reply_hdr[4];
     if (recv_all(sock, reply_hdr, sizeof(reply_hdr)) != 0) {
-        log_error("proxy_socks5_connect: failed to read reply header");
         close(sock);
         return -1;
     }
 
-    if (reply_hdr[0] != 0x05) {
-        log_error("proxy_socks5_connect: invalid reply ver %u", reply_hdr[0]);
+    if (reply_hdr[0] != 0x05 || reply_hdr[1] != 0x00) {
+        /* Proxy reported error */
         close(sock);
         return -1;
     }
 
-    if (reply_hdr[1] != 0x00) {
-        log_error("proxy_socks5_connect: proxy reply error code %u", reply_hdr[1]);
-        close(sock);
-        return -1;
-    }
-
-    /* read BND.ADDR based on ATYP, then BND.PORT (2 bytes) */
+    /* Consume the rest of the response based on ATYP */
     if (reply_hdr[3] == 0x01) {
-        /* IPv4: 4 bytes addr + 2 bytes port */
-        unsigned char addrbuf[6];
+        unsigned char addrbuf[6]; // IPv4 (4) + Port (2)
         if (recv_all(sock, addrbuf, sizeof(addrbuf)) != 0) {
-            log_error("proxy_socks5_connect: failed to read bnd.addr IPv4");
             close(sock);
             return -1;
         }
-        /* ignore values */
     } else if (reply_hdr[3] == 0x03) {
-        /* domain: first length, then name, then 2 bytes port */
         unsigned char lenb;
         if (recv_all(sock, &lenb, 1) != 0) {
-            log_error("proxy_socks5_connect: failed to read bnd.addr domain len");
             close(sock);
             return -1;
         }
@@ -271,32 +265,27 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
         if (name_len > 0) {
             unsigned char tmpbuf[256];
             if (recv_all(sock, tmpbuf, name_len) != 0) {
-                log_error("proxy_socks5_connect: failed to read bnd.addr domain name");
                 close(sock);
                 return -1;
             }
         }
         unsigned char portbuf[2];
         if (recv_all(sock, portbuf, 2) != 0) {
-            log_error("proxy_socks5_connect: failed to read bnd.port");
             close(sock);
             return -1;
         }
     } else if (reply_hdr[3] == 0x04) {
-        /* IPv6 (16 bytes) + port(2) - consume */
-        unsigned char tmp[18];
+        unsigned char tmp[18]; // IPv6 (16) + Port (2)
         if (recv_all(sock, tmp, sizeof(tmp)) != 0) {
-            log_error("proxy_socks5_connect: failed to read bnd.addr IPv6");
             close(sock);
             return -1;
         }
     } else {
-        log_error("proxy_socks5_connect: unknown ATYP %u", reply_hdr[3]);
         close(sock);
         return -1;
     }
 
-    /* success */
+    /* Success: return the open socket */
     *out_fd = sock;
     return 0;
 }
