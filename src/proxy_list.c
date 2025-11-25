@@ -14,7 +14,8 @@
 #define BTKG_PROXY_LIST_INITIAL_CAP 64
 #endif
 
-#define IPV4_STR_MAX 64
+/* Increased to support Domain Names */
+#define IPV4_STR_MAX 256
 
 /* Remove whitespace */
 static char* trim(char *s) {
@@ -67,12 +68,18 @@ int btkg_proxy_list_append(btkg_proxy_list_t *list,
 {
     if (!list || !ip) return -1;
 
-    /* Validate IPv4 */
-    struct in_addr ina;
-    if (inet_pton(AF_INET, ip, &ina) != 1) {
-        log_error("proxy_list_append: invalid IPv4 '%s'", ip);
+    /* 
+     * FIXED: Removed inet_pton check. 
+     * We now support hostnames (e.g., "proxy.example.com"), so we cannot 
+     * force the input to be a numeric IPv4.
+     */
+    
+    /* Sanity check: ensure length fits in our struct */
+    if (strlen(ip) >= IPV4_STR_MAX) {
+        log_error("proxy_list_append: hostname/IP too long");
         return -1;
     }
+
     if (port == 0) {
         log_error("proxy_list_append: invalid port 0");
         return -1;
@@ -129,7 +136,7 @@ static int parse_proxy_line(char *line,
 
     if (i < 2) return 0;  /* at least ip:port */
 
-    /* IP */
+    /* IP or Hostname */
     strncpy(ip, tok[0], IPV4_STR_MAX - 1);
     ip[IPV4_STR_MAX - 1] = 0;
 
