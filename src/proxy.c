@@ -301,18 +301,19 @@ int btkg_proxy_socks5_connect(btkg_context_t *context,
     }
 
     /* Consume Remainder */
+/* Consume Remainder */
     if (reply_hdr[3] == 0x01) {
         unsigned char buf[6];
-        recv_all(sock, buf, 6);
+        recv_all(sock, buf, sizeof(buf));
     } else if (reply_hdr[3] == 0x03) {
         unsigned char lenb;
         if (recv_all(sock, &lenb, 1) == 0) {
             unsigned char buf[256 + 2];
-            recv_all(sock, buf, lenb + 2);
+            recv_all(sock, buf, (size_t)lenb + 2);
         }
     } else if (reply_hdr[3] == 0x04) {
         unsigned char buf[18];
-        recv_all(sock, buf, 18);
+        recv_all(sock, buf, sizeof(buf));
     }
 
     *out_fd = sock;
