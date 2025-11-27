@@ -32,6 +32,7 @@ SOFTWARE.
 typedef struct {
 	char *host;
 	uint16_t port;
+	int cracked;
 } btkg_target_t;
 
 /**
